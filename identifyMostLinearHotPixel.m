@@ -1,7 +1,7 @@
-function [hotPixelCoords, noisePixelCoords] = identifyMostLinearHotPixel(windowContents, windowCoords)
-    correlationThreshold = 0.99;
+function [hotPixelCoords, noisePixelCoords] = identifyMostLinearHotPixel(windowContents, windowCoords, firingRateThreshold)
+    correlationThreshold = 0.9;
     R2Threshold = 0.99;
-    firingRateThreshold = 10; % Minimum number of timestamps for a hot pixel
+    % firingRateThreshold = 15; % Minimum number of timestamps for a hot pixel
     hotPixelData = {}; % Initialize to store hot pixels data (coords and R2)
     noisePixelData = {}; % Initialize to store noise pixels data (coords)
     
@@ -43,10 +43,19 @@ function [hotPixelCoords, noisePixelCoords] = identifyMostLinearHotPixel(windowC
 
     % Presuming numBins, correlationThreshold, R2Threshold, and firingRateThreshold are defined above
     numBins = 100; % Number of bins for binning timestamps
-    isLowCorrelation = checkLowCorrelation(flatTimeline, correlationThreshold, numBins);
+    [hasLowCorrelation, allStronglyCorrelated] = checkLowCorrelation(flatTimeline, correlationThreshold, numBins);
+    
+    % If all pixels are firing at the same rate, then do not consider as a
+    % hot pixel or noise, it must be an active source of information
+    % triggering too many events
+    if allStronglyCorrelated
+        hotPixelCoords = {};
+        noisePixelCoords = {};
+        return; % Early exit if there's high uniform correlation among pixels
+    end
 
     % Process each pixel only if overall correlation is low
-    if isLowCorrelation
+    if hasLowCorrelation
         for i = 1:numel(flatTimeline)
             timestamps = flatTimeline{i};
             
@@ -90,8 +99,7 @@ function coords = extractCoords(pixelData)
     end
 end
 
-function isLowCorrelation = checkLowCorrelation(flatContents, correlationThreshold, numBins)
-    % Define the common time range and bin the timestamps
+function [hasLowCorrelation, allStronglyCorrelated] = checkLowCorrelation(flatContents, correlationThreshold, numBins)
     minTime = inf;
     maxTime = -inf;
     for content = flatContents
@@ -100,34 +108,31 @@ function isLowCorrelation = checkLowCorrelation(flatContents, correlationThresho
             maxTime = max(maxTime, max(content{1}));
         end
     end
-
-    % Avoid division by zero in case all timestamps are identical
+    
     if minTime == maxTime
-        isLowCorrelation = true; % Consider as low correlation if there's not enough variability
+        hasLowCorrelation = false;
+        allStronglyCorrelated = true; % No variability implies strong correlation.
         return;
     end
-
-    % Bin the timestamps into a common set of intervals
+    
     binnedData = zeros(numel(flatContents), numBins);
     for i = 1:numel(flatContents)
         if ~isempty(flatContents{i})
             normalizedTimestamps = (flatContents{i} - minTime) / (maxTime - minTime);
             binIndices = ceil(normalizedTimestamps * numBins);
-            binIndices(binIndices < 1) = 1; % Ensure indices are within bounds
+            binIndices(binIndices < 1) = 1;
             binIndices(binIndices > numBins) = numBins;
             for index = binIndices
                 binnedData(i, index) = binnedData(i, index) + 1;
             end
         end
     end
-
-    % Calculate the pairwise correlation matrix from the binned data
+    
     corrMatrix = corr(binnedData');
-
-    % Calculate average correlation excluding NaN values and self-correlations
-    corrMatrix(tril(true(size(corrMatrix)))) = NaN; % Ignore lower triangle and diagonal
-    avgCorrelation = nanmean(corrMatrix(:));
-
-    % Determine if the overall correlation is considered low
-    isLowCorrelation = avgCorrelation < correlationThreshold;
+    avgCorrelation = mean(corrMatrix(~isnan(corrMatrix) & ~isinf(corrMatrix) & corrMatrix~=1));
+    
+    % Determine conditions
+    hasLowCorrelation = any(avgCorrelation < correlationThreshold);
+    allStronglyCorrelated = all(avgCorrelation >= correlationThreshold) && ~isempty(avgCorrelation);
 end
+
