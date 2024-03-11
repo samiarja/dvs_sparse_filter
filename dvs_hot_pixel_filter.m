@@ -1,19 +1,28 @@
 % load("focus_td_dataForDesign.mat");td.ts = td.ts - td.ts(1);
 % load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-52-19Z_speed_survey_191.930378_-59.688764_0.125/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-52-39Z_speed_survey_191.930378_-59.688764_0.0625/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-53-06Z_speed_survey_191.930378_-59.688764_0.03125/psee400.mat')
 % load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-54-28Z_speed_survey_191.930378_-59.688764_0.00390625/psee400.mat')
-% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-29T11-43-31Z_speed_survey-REGULAR/files/2022-03-29T11-52-30Z_speed_survey_114.825500_5.224993_0.0009765625/psee400.mat')
-% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-58-22Z_speed_survey_191.930378_-59.688764_7.62939453125e-06/psee400.mat')
-% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-56-38Z_speed_survey_191.930378_-59.688764_0.0001220703125/psee400.mat')
 % load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-55-46Z_speed_survey_191.930378_-59.688764_0.00048828125/psee400.mat')
-load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-53-06Z_speed_survey_191.930378_-59.688764_0.03125/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-56-38Z_speed_survey_191.930378_-59.688764_0.0001220703125/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-58-22Z_speed_survey_191.930378_-59.688764_7.62939453125e-06/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-52-03Z_speed_survey_191.930378_-59.688764_0.25/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-53-34Z_speed_survey_191.930378_-59.688764_0.015625/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-54-02Z_speed_survey_191.930378_-59.688764_0.0078125/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-54-55Z_speed_survey_191.930378_-59.688764_0.001953125/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-55-20Z_speed_survey_191.930378_-59.688764_0.0009765625/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-57-04Z_speed_survey_191.930378_-59.688764_6.103515625e-05/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-57-30Z_speed_survey_191.930378_-59.688764_3.0517578125e-05/psee400.mat')
+% load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-57-56Z_speed_survey_191.930378_-59.688764_1.52587890625e-05/psee400.mat')
+load('/home/samiarja/Desktop/PhD/Dataset/NORALPH_ICNS_EB_Space_Imaging_Speed_Dataset/2022-03-31T11-51-20Z_speed_survey-WINDY/files/2022-03-31T11-58-22Z_speed_survey_191.930378_-59.688764_7.62939453125e-06/psee400.mat')
 
 td = struct("x",double(events(:,2)),"y",double(events(:,3)),"p",double(events(:,4)),"ts",double(events(:,1)));
 td.x = td.x+1;td.y = td.y+1;
 
 
-fig = 0;
+fig = 1;
 RoiSize = 3;
-firingRateThreshold = 10;
+firingRateThreshold = 5;
 nEvent = numel(td.x);
 tListCell = cell(RoiSize,RoiSize);
 xMax = max(td.x);yMax = max(td.y);
