@@ -1,12 +1,14 @@
-# A General-Purpose Algorithm for Hot Pixel and Background Noise Removal for Neuromorphic Space Imaging
+# Denoising Very Sparse Events for Neuromorphic Space Imaging
 
-<p align="center" width="100%">
+<!-- <p align="center" width="100%">
     <img width="50%" src="fig/hot_pixel_package_logo2.png">
-</p>
-
+</p> -->
+<!-- 
 # Objective
 
-A pixel-wise approach to remove any short and long lasting hot pixels from any event stream without knowing the true number of the hot pixels, using just a single parameter.
+A pixel-wise approach to remove any short and long lasting hot pixels from any event stream without knowing the true number of the hot pixels, using just a single parameter. -->
+
+Project page: https://samiarja.github.io/dvseventfilter/
 
 # Installation
 
