@@ -52,6 +52,8 @@ import plotly.graph_objects as go
 import scipy.io as sio
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import colorsys
+import time
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 
 # import cache
 # import stars
@@ -280,6 +282,300 @@ class CumulativeMap:
     def __init__(self, pixels, offset=0):
         self.pixels = pixels
         self.offset = offset
+
+
+#####################################################################
+DEFAULT_TIMESTAMP = -1
+
+class SpatioTemporalCorrelationFilter:
+    def __init__(self, size_x, size_y, subsample_by=1):
+        self.num_must_be_correlated = 3  # k (constant)
+        self.shot_noise_correlation_time_s = 0.01  # tau (variable for ROC)
+        self.filter_alternative_polarity_shot_noise_enabled = False
+        self.subsample_by = subsample_by
+        self.size_x = size_x
+        self.size_y = size_y
+        self.sxm1 = size_x - 1
+        self.sym1 = size_y - 1
+        self.ssx = self.sxm1 >> subsample_by
+        self.ssy = self.sym1 >> subsample_by
+        self.timestamp_image = numpy.full((self.ssx + 1, self.ssy + 1), DEFAULT_TIMESTAMP, dtype=numpy.int32)
+        self.pol_image = numpy.zeros((self.ssx + 1, self.ssy + 1), dtype=numpy.int8)
+        self.reset_shot_noise_test_stats()
+
+    def reset_shot_noise_test_stats(self):
+        self.num_shot_noise_tests = 0
+        self.num_alternating_polarity_shot_noise_events_filtered_out = 0
+
+    def reset_filter(self):
+        self.timestamp_image.fill(DEFAULT_TIMESTAMP)
+        self.reset_shot_noise_test_stats()
+
+    def filter_packet(self, events):
+        dt = int(round(self.shot_noise_correlation_time_s * 1e6))
+        filtered_events = []
+        for event in events:
+            ts, x, y, on = event
+            x >>= self.subsample_by
+            y >>= self.subsample_by
+            if not (0 <= x <= self.ssx and 0 <= y <= self.ssy):
+                continue
+            if self.timestamp_image[x, y] == DEFAULT_TIMESTAMP:
+                self.store_timestamp_polarity(x, y, ts, on)
+                continue
+            ncorrelated = self.count_correlated_events(x, y, ts, dt)
+            if ncorrelated < self.num_must_be_correlated:
+                continue
+            if self.filter_alternative_polarity_shot_noise_enabled and self.test_filter_out_shot_noise_opposite_polarity(x, y, ts, on):
+                continue
+            filtered_events.append(event)
+            self.store_timestamp_polarity(x, y, ts, on)
+        return numpy.array(filtered_events, dtype=events.dtype)
+
+    def count_correlated_events(self, x, y, ts, dt):
+        ncorrelated = 0
+        for xx in range(max(0, x - 1), min(self.ssx, x + 1) + 1):
+            for yy in range(max(0, y - 1), min(self.ssy, y + 1) + 1):
+                if xx == x and yy == y:
+                    continue
+                last_ts = self.timestamp_image[xx, yy]
+                if 0 <= ts - last_ts < dt:
+                    ncorrelated += 1
+        return ncorrelated
+
+    def store_timestamp_polarity(self, x, y, ts, on):
+        self.timestamp_image[x, y] = ts
+        self.pol_image[x, y] = 1 if on else -1
+
+    def test_filter_out_shot_noise_opposite_polarity(self, x, y, ts, on):
+        prev_ts = self.timestamp_image[x, y]
+        prev_pol = self.pol_image[x, y]
+        if on == (prev_pol == 1):
+            return False
+        dt = ts - prev_ts
+        if dt > self.shot_noise_correlation_time_s * 1e6:
+            return False
+        self.num_alternating_polarity_shot_noise_events_filtered_out += 1
+        return True
+
+
+def plot_roc_curve(fpr,tpr):
+    # auc = roc_auc_score(y_true,y_score)
+    plt.xlabel('FPR')
+    plt.ylabel('TPR')
+    # plt.title('roc curve' + str(auc))
+    plt.plot(fpr,tpr,color='b',linewidth=1)
+    plt.plot([0,1],[0,1],'r--')
+    # plt.savefig(prefix + '_roccurve.pdf')
+    # plt.clf()
+    plt.show()
+
+
+def roc_val(detected_noise, ground_truth):
+    """
+    Calculate the true positive (TP), true negative (TN), false positive (FP), and false negative (FN) rates.
+
+    Parameters:
+    label_hotpix_binary (numpy.array or list): Binary array or list where:
+        - 0 indicates not detected noise event (considered as signal)
+        - 1 indicates detected noise event
+    ground_truth (numpy.array or list): Binary array or list where:
+        - 0 indicates non-signal event (considered as noise)
+        - 1 indicates signal event
+
+    Returns:
+    tuple: Normalized values of TP, TN, FP, and FN in the form (TP, TN, FP, FN)
+
+    Definitions:
+    - True Positive (TP): Signal event correctly labeled as signal (detected_noise == 0 and ground_truth == 1)
+    - True Negative (TN): Noise event correctly labeled as noise (detected_noise == 1 and ground_truth == 0)
+    - False Positive (FP): Noise event incorrectly labeled as signal (detected_noise == 0 and ground_truth == 0)
+    - False Negative (FN): Signal event incorrectly labeled as noise (detected_noise == 1 and ground_truth == 1)
+    """
+    detected_noise  = numpy.array(detected_noise)
+    ground_truth    = numpy.array(ground_truth)
+
+    # TP: Signal correctly labeled as signal
+    TP = numpy.sum((detected_noise == 0) & (ground_truth == 1))
+    # TN: Noise correctly labeled as noise
+    TN = numpy.sum((detected_noise == 1) & (ground_truth == 0))
+    # FP: Noise incorrectly labeled as signal
+    FP = numpy.sum((detected_noise == 0) & (ground_truth == 0))
+    # FN: Signal incorrectly labeled as noise
+    FN = numpy.sum((detected_noise == 1) & (ground_truth == 1))
+    
+    total = len(ground_truth)
+    normalized_TP = TP / total
+    normalized_TN = TN / total
+    normalized_FP = FP / total
+    normalized_FN = FN / total
+    
+    # Compute precision, recall, and F1-score
+    precision   = precision_score(ground_truth, 1 - detected_noise, pos_label=0)  # Set pos_label to 0 for noise
+    recall      = recall_score(ground_truth, 1 - detected_noise, pos_label=0)
+    f1          = f1_score(ground_truth, 1 - detected_noise, pos_label=0)
+    
+    print(f'TP: {TP} ({normalized_TP:.3f}), TN: {TN} ({normalized_TN:.3f}), FP: {FP} ({normalized_FP:.3f}), FN: {FN} ({normalized_FN:.3f})')
+    print(f'Precision: {precision:.3f}, Recall: {recall:.3f}, F1-score: {f1:.3f}')
+
+    return TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1
+
+
+
+def CrossConv(input_events, ground_truth, time_window):
+    print("Start processing CrossConv filter...")
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+
+    x = input_events['x']
+    y = input_events['y']
+    x_max, y_max = x.max() + 1, y.max() + 1
+
+    # Create a 2D histogram of event counts
+    event_count = numpy.zeros((x_max, y_max), dtype=int)
+    numpy.add.at(event_count, (x, y), 1)
+
+    kernels = [
+        numpy.array([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    ]
+
+    # Apply convolution with each kernel and calculate ratios
+    shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
+    max_shifted = numpy.maximum.reduce(shifted)
+    ratios = event_count / (max_shifted + 1.0)
+    smart_mask = ratios < 2.0 #this should be 3 ideally
+
+    yhot, xhot      = numpy.where(~smart_mask)
+    label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
+    for xi, yi in zip(xhot, yhot):
+        label_hotpix |= (y == xi) & (x == yi)
+    label_hotpix_binary = label_hotpix.astype(int)
+
+    jj              = numpy.where(label_hotpix_binary==0)[0]
+    output_events   = input_events[jj]
+
+    print(f'Number of detected hot pixels: {len(xhot)}')
+    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix)}')
+
+    detected_noise  = label_hotpix_binary
+    ground_truth    = ground_truth[ii]
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score  = roc_val(detected_noise, ground_truth)
+    performance     = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+def STCF(input_events, ground_truth, time_window):
+    print("Start processing STCF filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    # Create filter instance
+    filter_instance = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max)
+
+    # Prepare events
+    events = numpy.zeros((len(input_events), 4), dtype=int)
+    events[:, 0] = input_events['t']
+    events[:, 1] = input_events['x']
+    events[:, 2] = input_events['y']
+    events[:, 3] = input_events['on']
+
+    # Filter events
+    filtered_events = filter_instance.filter_packet(events)
+
+    # Extract filtered event indices
+    filtered_indices = numpy.isin(input_events['t'], filtered_events[:, 0])
+
+    # Prepare output events
+    output_events = input_events[filtered_indices]
+
+    # Create label_hotpix_binary for detected noise
+    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
+    label_hotpix_binary[filtered_indices] = 0
+
+    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
+    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
+
+    detected_noise = label_hotpix_binary
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+def MLPF(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "MLPF performance metrics" 
+    return output_events, performance
+
+def deFEAST(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "deFEAST performance metrics" 
+    return output_events, performance
+
+def DWF(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "DWF performance metrics" 
+    return output_events, performance
+
+def TS(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "TS performance metrics" 
+    return output_events, performance
+
+def YNoise(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "YNoise performance metrics" 
+    return output_events, performance
+
+def RED(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "RED performance metrics" 
+    return output_events, performance
+
+def KNoise(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "KNoise performance metrics" 
+    return output_events, performance
+
+def EvFlow(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "EvFlow performance metrics" 
+    return output_events, performance
+
+def BAF(input_events, ground_truth, time_window):
+    output_events = input_events  # Replace with actual processing
+    performance = "BAF performance metrics" 
+    return output_events, performance
+
+
+
+def filter_events(input_events, ground_truth, time_window, method="STCF", save_performance=True):
+    # Get the method function based on the method name
+    method_function = globals().get(method)
+    
+    if method_function is None:
+        raise ValueError(f"Method {method} not found")
+    
+    # Execute the method function
+    start_time = time.time()
+    output_events, performance = method_function(input_events, ground_truth, time_window)
+    end_time = time.time()
+    
+    # Save performance metrics if requested
+    if save_performance:
+        performance += f" | Execution time: {end_time - start_time} seconds"
+    
+    return output_events, performance if save_performance else output_events
+
+###########################################################################
 
 def accumulate4D_placeholder(sensor_size, events, linear_vel, angular_vel, zoom):
     # Placeholder function to simulate accumulate4D.
