@@ -54,6 +54,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 import colorsys
 import time
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
+from math import exp, isfinite
 
 # import cache
 # import stars
@@ -285,11 +286,170 @@ class CumulativeMap:
 
 
 #####################################################################
-DEFAULT_TIMESTAMP = -1
 
+class TimeSurfaceFilter:
+    def __init__(self, resolution, decay=70000, search_radius=1, float_threshold=0.2):
+        self.mWidth = resolution[0]
+        self.mHeight = resolution[1]
+        self.mDecay = decay
+        self.mSearchRadius = search_radius
+        self.mFloatThreshold = float_threshold
+        self.mOffsets = self._initialize_offsets(search_radius)
+        
+        event_dtype = numpy.dtype([('t', '<u8'), ('x', '<u2'), ('y', '<u2'), ('on', '?')])
+        self.mPos = numpy.zeros((self.mWidth, self.mHeight), dtype=event_dtype)
+        self.mNeg = numpy.zeros((self.mWidth, self.mHeight), dtype=event_dtype)
+
+    def _initialize_offsets(self, radius):
+        offsets = []
+        for x in range(-radius, radius + 1):
+            for y in range(-radius, radius + 1):
+                if x != 0 or y != 0:
+                    offsets.append((x, y))
+        return offsets
+
+    def fit_time_surface(self, event):
+        support = 0
+        diff_time = 0
+
+        cell = self.mPos if event['on'] else self.mNeg
+        for delta in self.mOffsets:
+            x = event['x'] + delta[0]
+            y = event['y'] + delta[1]
+
+            if x < 0 or y < 0 or x >= self.mWidth or y >= self.mHeight:
+                continue
+
+            if cell[x, y]['t'] == 0:
+                continue
+
+            time_diff = (numpy.int64(cell[x, y]['t']) - numpy.int64(event['t'])) / self.mDecay
+            if isfinite(time_diff) and -700 < time_diff < 700:  # Ensure time_diff is within a reasonable range for exp()
+                diff_time += exp(time_diff)
+                support += 1
+
+        surface = 0 if support == 0 else diff_time / support
+        return surface
+
+    def evaluate(self, event):
+        surface = self.fit_time_surface(event)
+        is_signal = surface >= self.mFloatThreshold
+
+        if event['on']:
+            self.mPos[event['x'], event['y']] = event
+        else:
+            self.mNeg[event['x'], event['y']] = event
+
+        return is_signal
+
+    def retain(self, event):
+        return self.evaluate(event)
+
+    def accept(self, events):
+        filtered_events = []
+        for event in events:
+            if self.retain(event):
+                filtered_events.append(event)
+        return np.array(filtered_events, dtype=events.dtype)
+
+    def __lshift__(self, events):
+        return self.accept(events)
+
+
+class DoubleFixedWindowFilter:
+    def __init__(self, sx, sy, wlen=175, disThr=100, useDoubleMode=True, numMustBeCorrelated=8):
+        self.sx = sx
+        self.sy = sy
+        self.wlen = wlen
+        self.disThr = disThr
+        self.useDoubleMode = useDoubleMode
+        self.numMustBeCorrelated = numMustBeCorrelated
+        self.subsampleBy = 0
+        self.lastREvents = numpy.full((wlen, 2), -1, dtype=numpy.int64)
+        self.lastNEvents = numpy.full((wlen, 2), -1, dtype=numpy.int64) if useDoubleMode else None
+        self.fillindex = 0
+        self.ts = 0
+
+    def filter_packet(self, events):
+        filtered_events = []
+        for e in events:
+            self.ts = e['t']
+            x = e['x'] >> self.subsampleBy
+            y = e['y'] >> self.subsampleBy
+
+            if x < 0 or x > self.sx or y < 0 or y > self.sy:
+                continue
+
+            if self.fillindex < self.wlen and self.lastREvents[self.wlen - 1][0] == -1:
+                self.lastREvents[self.fillindex][0] = e['x']
+                self.lastREvents[self.fillindex][1] = e['y']
+                self.fillindex += 1
+                continue
+
+            ncorrelated = 0
+
+            if self.useDoubleMode:
+                dwlen = self.wlen // 2 if self.wlen > 1 else 1
+                noiseflag = True
+
+                for i in range(dwlen):
+                    dis = abs(numpy.int64(e['x']) - self.lastREvents[i][0]) + abs(numpy.int64(e['y']) - self.lastREvents[i][1])
+                    if dis < self.disThr:
+                        ncorrelated += 1
+                        if ncorrelated == self.numMustBeCorrelated:
+                            noiseflag = False
+                            break
+
+                if ncorrelated < self.numMustBeCorrelated:
+                    for i in range(dwlen):
+                        dis = abs(numpy.int64(e['x']) - self.lastNEvents[i][0]) + abs(numpy.int64(e['y']) - self.lastNEvents[i][1])
+                        if dis < self.disThr:
+                            ncorrelated += 1
+                            if ncorrelated == self.numMustBeCorrelated:
+                                noiseflag = False
+                                break
+
+                if not noiseflag:
+                    filtered_events.append(e)
+                    for i in range(dwlen - 1):
+                        self.lastREvents[i][0] = self.lastREvents[i + 1][0]
+                        self.lastREvents[i][1] = self.lastREvents[i + 1][1]
+                    self.lastREvents[dwlen - 1][0] = e['x']
+                    self.lastREvents[dwlen - 1][1] = e['y']
+                else:
+                    for i in range(dwlen - 1):
+                        self.lastNEvents[i][0] = self.lastNEvents[i + 1][0]
+                        self.lastNEvents[i][1] = self.lastNEvents[i + 1][1]
+                    self.lastNEvents[dwlen - 1][0] = e['x']
+                    self.lastNEvents[dwlen - 1][1] = e['y']
+            else:
+                noiseflag = True
+                for i in range(self.wlen):
+                    dis = abs(numpy.int64(e['x']) - self.lastREvents[i][0]) + abs(numpy.int64(e['y']) - self.lastREvents[i][1])
+                    if dis < self.disThr:
+                        ncorrelated += 1
+                        if ncorrelated == self.numMustBeCorrelated:
+                            noiseflag = False
+                            break
+
+                if not noiseflag:
+                    filtered_events.append(e)
+
+                for i in range(self.wlen - 1):
+                    self.lastREvents[i][0] = self.lastREvents[i + 1][0]
+                    self.lastREvents[i][1] = self.lastREvents[i + 1][1]
+                self.lastREvents[self.wlen - 1][0] = e['x']
+                self.lastREvents[self.wlen - 1][1] = e['y']
+
+        filtered_events_array = numpy.array(filtered_events, dtype=events.dtype)
+        return filtered_events_array
+
+
+
+DEFAULT_TIMESTAMP = -1
 class SpatioTemporalCorrelationFilter:
     def __init__(self, size_x, size_y, subsample_by=1):
-        self.num_must_be_correlated = 3  # k (constant)
+        self.num_must_be_correlated = 2  # k (constant)
         self.shot_noise_correlation_time_s = 0.01  # tau (variable for ROC)
         self.filter_alternative_polarity_shot_noise_enabled = False
         self.subsample_by = subsample_by
@@ -446,7 +606,7 @@ def CrossConv(input_events, ground_truth, time_window):
     shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
     max_shifted = numpy.maximum.reduce(shifted)
     ratios = event_count / (max_shifted + 1.0)
-    smart_mask = ratios < 2.0 #this should be 3 ideally
+    smart_mask = ratios < 1.0 #this should be 3 ideally
 
     yhot, xhot      = numpy.where(~smart_mask)
     label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
@@ -510,6 +670,77 @@ def STCF(input_events, ground_truth, time_window):
 
     return output_events, performance
 
+
+def DFWF(input_events, ground_truth, time_window):
+    print("Start processing DWF/FWF filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    # Create filter instance
+    filter_instance = DoubleFixedWindowFilter(sx=x_max, sy=y_max)
+
+    # Filter events
+    filtered_events = filter_instance.filter_packet(input_events)
+
+    # Extract filtered event indices
+    filtered_indices = numpy.isin(input_events['t'], filtered_events["t"])
+
+    # Prepare output events
+    output_events = input_events[filtered_indices]
+
+    # Create label_hotpix_binary for detected noise
+    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
+    label_hotpix_binary[filtered_indices] = 0
+
+    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
+    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
+
+    detected_noise = label_hotpix_binary
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+def TS(input_events, ground_truth, time_window):
+    print("Start processing TS filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    # Create filter instance
+    time_surface_filter = TimeSurfaceFilter(resolution=(x_max, y_max))
+    filtered_events = time_surface_filter << input_events
+
+    # Extract filtered event indices
+    filtered_indices = numpy.isin(input_events['t'], filtered_events[:, 0])
+
+    # Prepare output events
+    output_events = input_events[filtered_indices]
+
+    # Create label_hotpix_binary for detected noise
+    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
+    label_hotpix_binary[filtered_indices] = 0
+
+    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
+    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
+
+    detected_noise = label_hotpix_binary
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+
+
 def MLPF(input_events, ground_truth, time_window):
     output_events = input_events  # Replace with actual processing
     performance = "MLPF performance metrics" 
@@ -520,15 +751,7 @@ def deFEAST(input_events, ground_truth, time_window):
     performance = "deFEAST performance metrics" 
     return output_events, performance
 
-def DWF(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "DWF performance metrics" 
-    return output_events, performance
 
-def TS(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "TS performance metrics" 
-    return output_events, performance
 
 def YNoise(input_events, ground_truth, time_window):
     output_events = input_events  # Replace with actual processing
@@ -2969,6 +3192,188 @@ def subdivide_events(events: numpy.ndarray, sensor_size: Tuple[int, int], level:
             subvolumes.append(events[ii])
     return subvolumes
 
+# def find_optimal_focus_time(timestamps):
+#     stopping_threshold = 0.001
+#     eventstart_time = timestamps[0]
+#     eventend_time = timestamps[-1]
+#     golden_search_range = eventend_time - eventstart_time
+
+#     optimal_start_time = None
+#     optimal_end_time = None
+#     max_event_rate = 0
+
+#     iteration = 0
+#     fixed_delta_time = None
+
+#     while golden_search_range > stopping_threshold:
+#         print(golden_search_range)
+#         idx = (timestamps >= eventstart_time) & (timestamps <= eventend_time)
+#         t = timestamps[idx]
+
+#         if iteration < 2:
+#             time_range = t[-1] - t[0]
+#             delta_time = time_range * 0.618
+#             if iteration == 1:
+#                 fixed_delta_time = delta_time
+#         else:
+#             delta_time = fixed_delta_time
+
+#         fst_start_time = t[0]
+#         second_start_time = t[0] + (time_range * 0.381 if iteration < 2 else delta_time)
+
+#         event_rate = 0
+#         event_rate_sec = 0
+
+#         first_batch_event_rate = 0
+#         second_batch_event_rate = 0
+
+#         for i in range(len(t)):
+#             ev_t = t[i]
+#             if ev_t > fst_start_time and ev_t <= (fst_start_time + delta_time):
+#                 event_rate += 1
+#             elif ev_t > fst_start_time + delta_time:
+#                 event_rate /= delta_time
+#                 first_batch_event_rate = event_rate * delta_time
+#                 event_rate = 0
+#                 fst_start_time = ev_t
+
+#             if ev_t > second_start_time and ev_t <= (second_start_time + delta_time):
+#                 event_rate_sec += 1
+#             elif ev_t > second_start_time + delta_time:
+#                 event_rate_sec /= delta_time
+#                 second_batch_event_rate = event_rate_sec * delta_time
+#                 event_rate_sec = 0
+#                 second_start_time = ev_t
+
+#         if first_batch_event_rate > max_event_rate:
+#             max_event_rate = first_batch_event_rate
+#             optimal_start_time = fst_start_time - delta_time
+#             optimal_end_time = fst_start_time
+#         if second_batch_event_rate > max_event_rate:
+#             max_event_rate = second_batch_event_rate
+#             optimal_start_time = second_start_time - delta_time
+#             optimal_end_time = second_start_time
+
+#         golden_search_range = abs(optimal_end_time - optimal_start_time)
+#         eventstart_time = optimal_start_time
+#         eventend_time = optimal_end_time
+
+#         iteration += 1
+
+#     return optimal_start_time, optimal_end_time
+
+def dvs_autofocustt(events: numpy.ndarray):
+    """
+    Find the timestamp where the focus was correct
+    Re-implementation from this paper:
+    Autofocus for Event Cameras, CVPR'22
+    """
+    timescale = 1
+    image_height = numpy.max(events['y'])
+    image_width = numpy.max(events['x'])
+
+    y_o = events['y']
+    x_o = events['x']
+    pol_o = events['on'].astype(int)
+    pol_o[pol_o == 0] = -1
+    t_o = events['t'] / timescale
+    t_o = t_o - t_o[0]
+
+    ev_rate_both = []
+    winner_index = []
+    time_batch1 = []
+    time_batch2 = []
+
+    optimal_focus_time = numpy.finfo(numpy.float64).max
+    prev_optimal_focus_time = 0
+    updated_focus_moving_step = numpy.finfo(numpy.float64).max
+    stopping_threshold = 0.001
+    eventstart_time = t_o[0]
+    eventend_time = t_o[-1]
+    golden_search_range = t_o[-1] - t_o[0]
+
+    max_event_rate = 0
+    max_event_rate_start_time = None
+    max_event_rate_end_time = None
+
+    while golden_search_range > stopping_threshold:
+        x = x_o.copy()
+        y = y_o.copy()
+        pol = pol_o.copy()
+        t = t_o.copy()
+        idx = (t >= eventstart_time) & (t <= eventend_time)
+        y = y[idx]
+        x = x[idx]
+        pol = pol[idx]
+        t = t[idx]
+
+        event_rate = 0
+        event_rate_sec = 0
+        event_rate_list = []
+
+        event_rate_ts_list = []
+        time_range = t[-1] - t[0]
+        golden_search_range = time_range
+        delta_time = time_range * 0.618
+        event_size = len(t)
+        fst_start_time = t[0]
+        second_start_time = t[0] + time_range * 0.381
+        EV_FLAG = True
+        EV_FLAG_SEC = True
+
+        first_batch_event_rate = 0
+        second_batch_event_rate = 0
+
+        for i in range(event_size):
+            ev_t = t[i]
+            if ev_t > fst_start_time and ev_t <= (fst_start_time + delta_time) and EV_FLAG:
+                event_rate += 1
+            elif ev_t > fst_start_time + delta_time and EV_FLAG:
+                event_rate = event_rate / delta_time
+                event_rate_list.append(event_rate)
+
+                time_batch1.append((fst_start_time, fst_start_time + delta_time))
+                first_batch_event_rate = event_rate * delta_time
+
+                event_rate_ts_list.append(fst_start_time + delta_time)
+                event_rate = 0
+                fst_start_time = ev_t
+                EV_FLAG = False
+
+            if ev_t > second_start_time and ev_t <= (second_start_time + delta_time) and EV_FLAG_SEC:
+                event_rate_sec += 1
+            elif ev_t > second_start_time + delta_time and EV_FLAG_SEC:
+                event_rate_sec = event_rate_sec / delta_time
+                event_rate_list.append(event_rate_sec)
+
+                time_batch2.append((second_start_time, second_start_time + delta_time))
+                second_batch_event_rate = event_rate_sec * delta_time
+
+                event_rate_ts_list.append(second_start_time + delta_time)
+                event_rate_sec = 0
+                second_start_time = ev_t
+                EV_FLAG_SEC = False
+
+        ev_rate_both.append((first_batch_event_rate, second_batch_event_rate))
+        if event_rate_list:
+            max_ev_rate_index = numpy.argmax(event_rate_list)
+            winner_index.append(max_ev_rate_index)
+            optimal_focus_time = event_rate_ts_list[max_ev_rate_index]
+            event_rate_output = event_rate_list[max_ev_rate_index] * delta_time
+            updated_focus_moving_step = abs(optimal_focus_time - prev_optimal_focus_time)
+            prev_optimal_focus_time = optimal_focus_time
+            eventstart_time = optimal_focus_time - delta_time
+            eventend_time = optimal_focus_time
+
+            if event_rate_output > max_event_rate:
+                max_event_rate = event_rate_output
+                max_event_rate_start_time = eventstart_time
+                max_event_rate_end_time = eventend_time
+        else:
+            return max_event_rate_start_time, max_event_rate_end_time
+
+    return max_event_rate_start_time, max_event_rate_end_time
+
 
 def dvs_autofocus(events: numpy.ndarray):
     """
@@ -2999,8 +3404,10 @@ def dvs_autofocus(events: numpy.ndarray):
     eventstart_time = t_o[0]
     eventend_time = t_o[-1]
     golden_search_range = t_o[-1] - t_o[0]
-
+    counterss = 0
+    save_time_boundary=[]
     while golden_search_range > stopping_threshold:
+        
         x   = x_o.copy()
         y   = y_o.copy()
         pol = pol_o.copy()
@@ -3024,6 +3431,13 @@ def dvs_autofocus(events: numpy.ndarray):
         second_start_time = t[0] + time_range * 0.381
         EV_FLAG = True
         EV_FLAG_SEC = True
+
+        batch1_wind1 = fst_start_time
+        batch1_wind2 = fst_start_time + delta_time
+        batch2_wind1 = second_start_time
+        batch2_wind2 = second_start_time + delta_time
+
+        save_time_boundary.append((batch1_wind1,batch1_wind2,batch2_wind1,batch2_wind2))
 
         for i in range(event_size):
             ev_t = t[i]
@@ -3059,6 +3473,14 @@ def dvs_autofocus(events: numpy.ndarray):
         if event_rate_list:
             max_ev_rate_index = numpy.argmax(event_rate_list)
             winner_index.append(max_ev_rate_index)
+
+            if max_ev_rate_index == 0:
+                time_start = save_time_boundary[counterss][0]
+                time_finish = save_time_boundary[counterss][1]
+            else:
+                time_start = save_time_boundary[counterss][2]
+                time_finish = save_time_boundary[counterss][3]
+
             optimal_focus_time = event_rate_ts_list[max_ev_rate_index]
             event_rate_output = event_rate_list[max_ev_rate_index]*delta_time
             updated_focus_moving_step = abs(optimal_focus_time - prev_optimal_focus_time)
@@ -3066,9 +3488,11 @@ def dvs_autofocus(events: numpy.ndarray):
             eventstart_time = optimal_focus_time - delta_time
             eventend_time = optimal_focus_time
         else:
-            return optimal_focus_time
+            return optimal_focus_time #,time_start,time_finish
 
-    return optimal_focus_time
+        counterss+=1
+
+    return optimal_focus_time #,time_start,time_finish
 
 def dvs_autofocus_test(events: numpy.ndarray):
 
