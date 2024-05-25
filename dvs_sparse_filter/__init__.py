@@ -286,9 +286,77 @@ class CumulativeMap:
 
 
 #####################################################################
+class YangNoise:
+    def __init__(self, resolution, duration=2000, search_radius=1, int_threshold=1):
+        self.mWidth = resolution[0]
+        self.mHeight = resolution[1]
+        self.mDuration = duration
+        self.mSearchRadius = search_radius
+        self.mIntThreshold = int_threshold
+
+        self.mOffsets = self._initialize_offsets(search_radius)
+        self.mTimestampMat = numpy.zeros((self.mWidth, self.mHeight), dtype=numpy.int64)
+        self.mPolarityMat = numpy.zeros((self.mWidth, self.mHeight), dtype=numpy.uint8)
+
+    def _initialize_offsets(self, radius):
+        offsets = []
+        for x in range(-radius, radius + 1):
+            for y in range(-radius, radius + 1):
+                if x != 0 or y != 0:
+                    offsets.append((x, y))
+        return offsets
+
+    def calculate_density(self, event):
+        density = 0
+
+        for delta in self.mOffsets:
+            x = event['x'] + delta[0]
+            y = event['y'] + delta[1]
+
+            if x < 0 or y < 0 or x >= self.mWidth or y >= self.mHeight:
+                continue
+
+            if event['t'] - self.mTimestampMat[x, y] > self.mDuration:
+                continue
+
+            if event['on'] != self.mPolarityMat[x, y]:
+                continue
+
+            density += 1
+
+        return density
+
+    def evaluate(self, event):
+        density = self.calculate_density(event)
+        is_signal = density >= self.mIntThreshold
+
+        self.mTimestampMat[event['x'], event['y']] = event['t']
+        self.mPolarityMat[event['x'], event['y']] = event['on']
+
+        return is_signal
+
+    def retain(self, event):
+        return self.evaluate(event)
+
+    def accept(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        filtered_events = []
+
+        for i, event in enumerate(events):
+            if self.retain(event):
+                filtered_events.append(event)
+            else:
+                boolean_mask[i] = True
+
+        filtered_events = numpy.array(filtered_events, dtype=events.dtype)
+        return boolean_mask, filtered_events
+
+    def __lshift__(self, events):
+        return self.accept(events)
+
 
 class TimeSurfaceFilter:
-    def __init__(self, resolution, decay=70000, search_radius=1, float_threshold=0.2):
+    def __init__(self, resolution, decay=100000, search_radius=1, float_threshold=0.2):
         self.mWidth = resolution[0]
         self.mHeight = resolution[1]
         self.mDecay = decay
@@ -311,7 +379,7 @@ class TimeSurfaceFilter:
     def fit_time_surface(self, event):
         support = 0
         diff_time = 0
-
+        
         cell = self.mPos if event['on'] else self.mNeg
         for delta in self.mOffsets:
             x = event['x'] + delta[0]
@@ -347,17 +415,20 @@ class TimeSurfaceFilter:
 
     def accept(self, events):
         filtered_events = []
-        for event in events:
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        for i, event in enumerate(events):
             if self.retain(event):
                 filtered_events.append(event)
-        return np.array(filtered_events, dtype=events.dtype)
+            else:
+                boolean_mask[i] = True
+        return boolean_mask, numpy.array(filtered_events, dtype=events.dtype)
 
     def __lshift__(self, events):
         return self.accept(events)
 
 
 class DoubleFixedWindowFilter:
-    def __init__(self, sx, sy, wlen=175, disThr=100, useDoubleMode=True, numMustBeCorrelated=8):
+    def __init__(self, sx, sy, wlen=175, disThr=100, useDoubleMode=False, numMustBeCorrelated=8):
         self.sx = sx
         self.sy = sy
         self.wlen = wlen
@@ -371,8 +442,9 @@ class DoubleFixedWindowFilter:
         self.ts = 0
 
     def filter_packet(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
         filtered_events = []
-        for e in events:
+        for idx, e in enumerate(events):
             self.ts = e['t']
             x = e['x'] >> self.subsampleBy
             y = e['y'] >> self.subsampleBy
@@ -417,6 +489,7 @@ class DoubleFixedWindowFilter:
                     self.lastREvents[dwlen - 1][0] = e['x']
                     self.lastREvents[dwlen - 1][1] = e['y']
                 else:
+                    boolean_mask[idx] = True
                     for i in range(dwlen - 1):
                         self.lastNEvents[i][0] = self.lastNEvents[i + 1][0]
                         self.lastNEvents[i][1] = self.lastNEvents[i + 1][1]
@@ -434,6 +507,8 @@ class DoubleFixedWindowFilter:
 
                 if not noiseflag:
                     filtered_events.append(e)
+                else:
+                    boolean_mask[idx] = True
 
                 for i in range(self.wlen - 1):
                     self.lastREvents[i][0] = self.lastREvents[i + 1][0]
@@ -442,7 +517,7 @@ class DoubleFixedWindowFilter:
                 self.lastREvents[self.wlen - 1][1] = e['y']
 
         filtered_events_array = numpy.array(filtered_events, dtype=events.dtype)
-        return filtered_events_array
+        return boolean_mask, filtered_events_array
 
 
 
@@ -472,25 +547,32 @@ class SpatioTemporalCorrelationFilter:
         self.reset_shot_noise_test_stats()
 
     def filter_packet(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
         dt = int(round(self.shot_noise_correlation_time_s * 1e6))
         filtered_events = []
-        for event in events:
-            ts, x, y, on = event
+        for i, event in enumerate(events):
+            ts, x, y, on = event["t"], event["x"], event["y"], event["on"]
             x >>= self.subsample_by
             y >>= self.subsample_by
             if not (0 <= x <= self.ssx and 0 <= y <= self.ssy):
+                boolean_mask[i] = True
                 continue
             if self.timestamp_image[x, y] == DEFAULT_TIMESTAMP:
                 self.store_timestamp_polarity(x, y, ts, on)
+                boolean_mask[i] = True
                 continue
             ncorrelated = self.count_correlated_events(x, y, ts, dt)
             if ncorrelated < self.num_must_be_correlated:
+                boolean_mask[i] = True
                 continue
             if self.filter_alternative_polarity_shot_noise_enabled and self.test_filter_out_shot_noise_opposite_polarity(x, y, ts, on):
+                boolean_mask[i] = True
                 continue
             filtered_events.append(event)
             self.store_timestamp_polarity(x, y, ts, on)
-        return numpy.array(filtered_events, dtype=events.dtype)
+
+        filtered_events_array = numpy.array(filtered_events, dtype=events.dtype)
+        return boolean_mask, filtered_events_array
 
     def count_correlated_events(self, x, y, ts, dt):
         ncorrelated = 0
@@ -617,8 +699,7 @@ def CrossConv(input_events, ground_truth, time_window):
     jj              = numpy.where(label_hotpix_binary==0)[0]
     output_events   = input_events[jj]
 
-    print(f'Number of detected hot pixels: {len(xhot)}')
-    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix)}')
+    print(f'Number of detected noise event: {numpy.sum(label_hotpix)}')
 
     detected_noise  = label_hotpix_binary
     ground_truth    = ground_truth[ii]
@@ -637,33 +718,11 @@ def STCF(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
-    # Create filter instance
-    filter_instance = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max)
+    filter_instance             = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max)
+    boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
-    # Prepare events
-    events = numpy.zeros((len(input_events), 4), dtype=int)
-    events[:, 0] = input_events['t']
-    events[:, 1] = input_events['x']
-    events[:, 2] = input_events['y']
-    events[:, 3] = input_events['on']
-
-    # Filter events
-    filtered_events = filter_instance.filter_packet(events)
-
-    # Extract filtered event indices
-    filtered_indices = numpy.isin(input_events['t'], filtered_events[:, 0])
-
-    # Prepare output events
-    output_events = input_events[filtered_indices]
-
-    # Create label_hotpix_binary for detected noise
-    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
-    label_hotpix_binary[filtered_indices] = 0
-
-    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
-    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
-
-    detected_noise = label_hotpix_binary
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+    detected_noise = boolean_mask.astype(int)
 
     TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
     performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
@@ -679,27 +738,12 @@ def DFWF(input_events, ground_truth, time_window):
     ground_truth = ground_truth[ii]
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+    
+    filter_instance             = DoubleFixedWindowFilter(sx=x_max, sy=y_max)
+    boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
-    # Create filter instance
-    filter_instance = DoubleFixedWindowFilter(sx=x_max, sy=y_max)
-
-    # Filter events
-    filtered_events = filter_instance.filter_packet(input_events)
-
-    # Extract filtered event indices
-    filtered_indices = numpy.isin(input_events['t'], filtered_events["t"])
-
-    # Prepare output events
-    output_events = input_events[filtered_indices]
-
-    # Create label_hotpix_binary for detected noise
-    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
-    label_hotpix_binary[filtered_indices] = 0
-
-    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
-    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
-
-    detected_noise = label_hotpix_binary
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+    detected_noise = boolean_mask.astype(int)
 
     TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
     performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
@@ -715,30 +759,39 @@ def TS(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
-    # Create filter instance
     time_surface_filter = TimeSurfaceFilter(resolution=(x_max, y_max))
-    filtered_events = time_surface_filter << input_events
+    boolean_mask, output_events = time_surface_filter << input_events
 
-    # Extract filtered event indices
-    filtered_indices = numpy.isin(input_events['t'], filtered_events[:, 0])
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
-    # Prepare output events
-    output_events = input_events[filtered_indices]
-
-    # Create label_hotpix_binary for detected noise
-    label_hotpix_binary = numpy.ones(len(input_events), dtype=int)
-    label_hotpix_binary[filtered_indices] = 0
-
-    print(f'Number of detected hot pixels: {len(input_events) - len(filtered_events)}')
-    print(f'Events marked as hot pixels: {numpy.sum(label_hotpix_binary)}')
-
-    detected_noise = label_hotpix_binary
+    detected_noise = boolean_mask.astype(int)
 
     TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
     performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
 
     return output_events, performance
 
+
+def YNoise(input_events, ground_truth, time_window):
+    print("Start processing YNoise filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    yang_noise_filter             = YangNoise(resolution=(x_max, y_max))
+    boolean_mask, output_events = yang_noise_filter << input_events
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+
+    detected_noise = boolean_mask.astype(int)
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
 
 
 def MLPF(input_events, ground_truth, time_window):
@@ -751,12 +804,6 @@ def deFEAST(input_events, ground_truth, time_window):
     performance = "deFEAST performance metrics" 
     return output_events, performance
 
-
-
-def YNoise(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "YNoise performance metrics" 
-    return output_events, performance
 
 def RED(input_events, ground_truth, time_window):
     output_events = input_events  # Replace with actual processing
@@ -3163,7 +3210,7 @@ def dvs_sparse_filter_alex_conv(events):
         label_hotpix |= (y == xi) & (x == yi)
     label_hotpix_binary = label_hotpix.astype(int)
 
-    print(f'Number of detected hot pixels: {len(xhot)}')
+    print(f'Number of detected noise event: {len(xhot)}')
     print(f'Events marked as hot pixels: {numpy.sum(label_hotpix)}')
 
     return label_hotpix_binary
