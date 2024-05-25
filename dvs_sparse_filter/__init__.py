@@ -55,6 +55,8 @@ import colorsys
 import time
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from math import exp, isfinite
+from scipy.linalg import expm, lstsq
+from collections import deque
 
 # import cache
 # import stars
@@ -286,7 +288,169 @@ class CumulativeMap:
 
 
 #####################################################################
-class YangNoise:
+class EventFlowFilter:
+    def __init__(self, resolution, duration=1e5, search_radius=3, float_threshold=20.0):
+        self.mWidth = resolution[0]
+        self.mHeight = resolution[1]
+        self.mDuration = duration
+        self.mSearchRadius = search_radius
+        self.mFloatThreshold = float_threshold
+
+        self.mDeque = deque()
+
+    def fit_event_flow(self, event):
+        # Default flow value will be infinity
+        flow = numpy.inf
+        
+        # Search spatio-temporal related events
+        candidate_events = []
+        for deque_event in self.mDeque:
+            if (abs(int(event['x']) - int(deque_event['x'])) <= self.mSearchRadius) and \
+               (abs(int(event['y']) - int(deque_event['y'])) <= self.mSearchRadius):
+                candidate_events.append(deque_event)
+
+        # Calculate flow
+        if len(candidate_events) > 3:
+            A = numpy.zeros((len(candidate_events), 3))
+            b = numpy.zeros(len(candidate_events))
+            for i, candidate_event in enumerate(candidate_events):
+                A[i, 0] = candidate_event['x']
+                A[i, 1] = candidate_event['y']
+                A[i, 2] = 1.0
+                b[i] = (int(candidate_event['t']) - int(event['t'])) * 1E-3
+
+            # Solve
+            X, residuals, rank, s = lstsq(A, b)
+            if X[0] != 0 and X[1] != 0:  # Avoid division by zero
+                flow = numpy.sqrt((1 / X[0]) ** 2 + (1 / X[1]) ** 2)
+
+        return flow
+
+    def evaluate(self, event):
+        # Calculate density in spatio-temporal neighborhood
+        flow = self.fit_event_flow(event)
+
+        # Evaluate
+        is_signal = (flow <= self.mFloatThreshold)
+
+        # Update deque
+        while self.mDeque and (int(event['t']) - int(self.mDeque[0]['t']) >= self.mDuration):
+            self.mDeque.popleft()
+        self.mDeque.append(event)
+
+        return is_signal
+
+    def retain(self, event):
+        return self.evaluate(event)
+
+    def accept(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        filtered_events = []
+
+        for i, event in enumerate(events):
+            if self.retain(event):
+                filtered_events.append(event)
+            else:
+                boolean_mask[i] = True
+
+        filtered_events = numpy.array(filtered_events, dtype=events.dtype)
+        return boolean_mask, filtered_events
+
+    def __lshift__(self, events):
+        return self.accept(events)
+
+
+class KhodamoradiNoiseFilter:
+    def __init__(self, resolution, duration=1e5, int_threshold=1):
+        self.mWidth = resolution[0]
+        self.mHeight = resolution[1]
+        self.mDuration = duration
+        self.mIntThreshold = int_threshold
+        self.intenrenr = 0
+
+        self.xCols = numpy.zeros(self.mWidth, dtype=[('t', 'int64'), ('x', 'int16'), ('y', 'int16'), ('p', 'bool')])
+        self.yRows = numpy.zeros(self.mHeight, dtype=[('t', 'int64'), ('x', 'int16'), ('y', 'int16'), ('p', 'bool')])
+        
+    def search_correlation(self, event):
+        support = 0
+        x, y, t, p = event['x'], event['y'], event['t'], event['on']
+        x_minus_one = (x > 0)
+        x_plus_one = (x < (self.mWidth - 1))
+        y_minus_one = (y > 0)
+        y_plus_one = (y < (self.mHeight - 1))
+
+        if x_minus_one:
+            x_prev = self.xCols[x - 1]
+            if (t - x_prev['t']) <= self.mDuration and p == x_prev['p']:
+                if ((y_minus_one and x_prev['y'] == y - 1) or x_prev['y'] == y or (y_plus_one and x_prev['y'] == y + 1)):
+                    support += 1
+
+        x_cell = self.xCols[x]
+        if (t - x_cell['t']) <= self.mDuration and p == x_cell['p']:
+            if ((y_minus_one and x_cell['y'] == y - 1) or (y_plus_one and x_cell['y'] == y + 1)):
+                support += 1
+
+        if x_plus_one:
+            x_next = self.xCols[x + 1]
+            if (t - x_next['t']) <= self.mDuration and p == x_next['p']:
+                if ((y_minus_one and x_next['y'] == y - 1) or x_next['y'] == y or (y_plus_one and x_next['y'] == y + 1)):
+                    support += 1
+
+        if y_minus_one:
+            y_prev = self.yRows[y - 1]
+            if (t - y_prev['t']) <= self.mDuration and p == y_prev['p']:
+                if ((x_minus_one and y_prev['x'] == x - 1) or y_prev['x'] == x or (x_plus_one and y_prev['x'] == x + 1)):
+                    support += 1
+
+        y_cell = self.yRows[y]
+        if (t - y_cell['t']) <= self.mDuration and p == y_cell['p']:
+            if ((x_minus_one and y_cell['x'] == x - 1) or (x_plus_one and y_cell['x'] == x + 1)):
+                support += 1
+
+        if y_plus_one:
+            y_next = self.yRows[y + 1]
+            if (t - y_next['t']) <= self.mDuration and p == y_next['p']:
+                if ((x_minus_one and y_next['x'] == x - 1) or y_next['x'] == x or (x_plus_one and y_next['x'] == x + 1)):
+                    support += 1
+
+        return support
+    
+    def evaluate(self, event):
+        support = self.search_correlation(event)
+        
+        # if support > 2:
+        #     self.intenrenr +=1
+        #     print(support)
+        # print(self.intenrenr)
+
+        is_signal = (support >= self.mIntThreshold)
+
+        self.xCols[event['x']] = event
+        self.yRows[event['y']] = event
+
+        return is_signal
+
+    def retain(self, event):
+        return self.evaluate(event)
+
+    def accept(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        filtered_events = []
+
+        for i, event in enumerate(events):
+            if self.retain(event):
+                filtered_events.append(event)
+            else:
+                boolean_mask[i] = True
+
+        filtered_events = numpy.array(filtered_events, dtype=events.dtype)
+        return boolean_mask, filtered_events
+
+    def __lshift__(self, events):
+        return self.accept(events)
+
+
+class YangNoiseFilter:
     def __init__(self, resolution, duration=2000, search_radius=1, int_threshold=1):
         self.mWidth = resolution[0]
         self.mHeight = resolution[1]
@@ -781,8 +945,53 @@ def YNoise(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
-    yang_noise_filter             = YangNoise(resolution=(x_max, y_max))
+    yang_noise_filter             = YangNoiseFilter(resolution=(x_max, y_max))
     boolean_mask, output_events = yang_noise_filter << input_events
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+
+    detected_noise = boolean_mask.astype(int)
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+
+
+def KNoise(input_events, ground_truth, time_window):
+    print("Start processing KNoise filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    khodamoradi_noise             = KhodamoradiNoiseFilter(resolution=(x_max, y_max))
+    boolean_mask, output_events = khodamoradi_noise << input_events
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+
+    detected_noise = boolean_mask.astype(int)
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+
+def EvFlow(input_events, ground_truth, time_window):
+    print("Start processing EvFlow filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    event_flow                  = EventFlowFilter(resolution=(x_max, y_max))
+    boolean_mask, output_events = event_flow << input_events
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
@@ -802,27 +1011,6 @@ def MLPF(input_events, ground_truth, time_window):
 def deFEAST(input_events, ground_truth, time_window):
     output_events = input_events  # Replace with actual processing
     performance = "deFEAST performance metrics" 
-    return output_events, performance
-
-
-def RED(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "RED performance metrics" 
-    return output_events, performance
-
-def KNoise(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "KNoise performance metrics" 
-    return output_events, performance
-
-def EvFlow(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "EvFlow performance metrics" 
-    return output_events, performance
-
-def BAF(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "BAF performance metrics" 
     return output_events, performance
 
 
