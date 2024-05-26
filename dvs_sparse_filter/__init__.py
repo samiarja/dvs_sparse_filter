@@ -1005,7 +1005,7 @@ def EvFlow(input_events, ground_truth, time_window):
 
 def MLPF(input_events, ground_truth, time_window):
     output_events = input_events  # Replace with actual processing
-    performance = "MLPF performance metrics" 
+    performance = "MLPF performance metrics"
     return output_events, performance
 
 def deFEAST(input_events, ground_truth, time_window):
