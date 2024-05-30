@@ -288,6 +288,97 @@ class CumulativeMap:
 
 
 #####################################################################
+class InceptiveFilter:
+    def __init__(self, multiTriggerWindow):
+        self.multiTriggerWindow = multiTriggerWindow
+
+    def find_ie(self, idx, ts, p):
+        idx = numpy.sort(idx)
+        idxp = numpy.where(p[idx] > 0)[0]
+        idxn = numpy.where(p[idx] <= 0)[0]
+
+        ie_idxp, ie_idxn = [], []
+
+        if idxp.size > 0:
+            multiEventp = numpy.concatenate(([False], numpy.diff(ts[idx[idxp]]) <= self.multiTriggerWindow))
+            ieIdxp = numpy.diff(numpy.concatenate(([0], multiEventp))) == 1
+            idxp = idxp[ieIdxp]
+
+        if idxn.size > 0:
+            multiEventn = numpy.concatenate(([False], numpy.diff(ts[idx[idxn]]) <= self.multiTriggerWindow))
+            ieIdxn = numpy.diff(numpy.concatenate(([0], multiEventn))) == 1
+            idxn = idxn[ieIdxn]
+
+        return numpy.concatenate((idx[idxp], idx[idxn]))
+
+    def find_te(self, idx, ts, p):
+        idx = numpy.sort(idx)
+        idxp = numpy.where(p[idx] > 0)[0]
+        idxn = numpy.where(p[idx] <= 0)[0]
+
+        te_idxp, te_idxn = [], []
+
+        if idxp.size > 0:
+            multiEventp = numpy.concatenate(([False], numpy.diff(ts[idx[idxp]]) <= self.multiTriggerWindow))
+            teIdxp = numpy.abs(numpy.diff(numpy.concatenate(([0], multiEventp)))) == 1
+            idxp = idxp[teIdxp]
+
+        if idxn.size > 0:
+            multiEventn = numpy.concatenate(([False], numpy.diff(ts[idx[idxn]]) <= self.multiTriggerWindow))
+            teIdxn = numpy.abs(numpy.diff(numpy.concatenate(([0], multiEventn)))) == 1
+            idxn = idxn[teIdxn]
+
+        return numpy.concatenate((idx[idxp], idx[idxn]))
+
+    def ie(self, x, y, ts, p, sensorDim):
+        numEvents = len(x)
+        hasDataIdx = numpy.ravel_multi_index((y, x), sensorDim)
+        N = numpy.arange(numEvents)
+
+        isIE = numpy.zeros(numEvents, dtype=bool)
+        unique_indices, inverse_indices = numpy.unique(hasDataIdx, return_inverse=True)
+        for i in range(len(unique_indices)):
+            idx = N[inverse_indices == i]
+            if len(idx) > 0:
+                ie_result = self.find_ie(idx, ts, p)
+                if len(ie_result) > 0:
+                    isIE[ie_result.astype(int)] = True
+
+        return isIE
+
+    def te(self, x, y, ts, p, sensorDim):
+        numEvents = len(x)
+        hasDataIdx = numpy.ravel_multi_index((y, x), sensorDim)
+        N = numpy.arange(numEvents)
+
+        isTE = numpy.zeros(numEvents, dtype=bool)
+        unique_indices, inverse_indices = numpy.unique(hasDataIdx, return_inverse=True)
+        for i in range(len(unique_indices)):
+            idx = N[inverse_indices == i]
+            if len(idx) > 0:
+                te_result = self.find_te(idx, ts, p)
+                if len(te_result) > 0:
+                    isTE[te_result.astype(int)] = True
+
+        return isTE
+
+    def filter(self, td):
+        x = td['x'].flatten()
+        y = td['y'].flatten()
+        p = td['on'].flatten()
+        p[p == 0] = 1
+        t = td['t'].flatten()
+        t = t - t[0]
+
+        sensorDim = [numpy.max(y) + 1, numpy.max(x) + 1]
+
+        isIE = self.ie(x, y, t, p, sensorDim)
+        isTE = self.te(x, y, t, p, sensorDim)
+
+        isNoise = numpy.logical_not(isIE) & numpy.logical_not(isTE)
+        return isNoise
+
+
 class EventFlowFilter:
     def __init__(self, resolution, duration=1e5, search_radius=3, float_threshold=20.0):
         self.mWidth = resolution[0]
@@ -852,7 +943,7 @@ def CrossConv(input_events, ground_truth, time_window):
     shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
     max_shifted = numpy.maximum.reduce(shifted)
     ratios = event_count / (max_shifted + 1.0)
-    smart_mask = ratios < 1.0 #this should be 3 ideally
+    smart_mask = ratios < 1.0 #this should be 2 ideally
 
     yhot, xhot      = numpy.where(~smart_mask)
     label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
@@ -996,6 +1087,40 @@ def EvFlow(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
+    return output_events, performance
+
+
+def IETS(input_events, ground_truth, time_window):
+    print("Start processing IETS filter...")
+
+    # ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] > 0, input_events["t"] < 5e6))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    multiTriggerWindow = 2e6
+    inceptive_filter = InceptiveFilter(multiTriggerWindow)
+    detected_noise = inceptive_filter.filter(input_events)
+
+    output_events = input_events[~detected_noise]
+
+    warped_image = accumulate((1280,720), input_events, (0, 0))
+    rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    rendered_image.show()  
+
+    warped_image = accumulate((1280,720), output_events, (0, 0))
+    rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    rendered_image.show()  
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+
+    # detected_noise = boolean_mask.astype(int)
 
     TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
     performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
@@ -3635,12 +3760,12 @@ def dvs_autofocus(events: numpy.ndarray):
     optimal_focus_time = numpy.finfo(numpy.float64).max
     prev_optimal_focus_time = 0
     updated_focus_moving_step = numpy.finfo(numpy.float64).max
-    stopping_threshold = 0.001
+    stopping_threshold = 1
     eventstart_time = t_o[0]
     eventend_time = t_o[-1]
     golden_search_range = t_o[-1] - t_o[0]
     counterss = 0
-    save_time_boundary=[]
+    save_time_boundary = []
     while golden_search_range > stopping_threshold:
         
         x   = x_o.copy()
@@ -3657,6 +3782,7 @@ def dvs_autofocus(events: numpy.ndarray):
         event_rate_sec = 0
         event_rate_list = []
         
+        
         event_rate_ts_list = []
         time_range = t[-1] - t[0]
         golden_search_range = time_range
@@ -3672,7 +3798,7 @@ def dvs_autofocus(events: numpy.ndarray):
         batch2_wind1 = second_start_time
         batch2_wind2 = second_start_time + delta_time
 
-        save_time_boundary.append((batch1_wind1,batch1_wind2,batch2_wind1,batch2_wind2))
+        save_time_boundary.append((batch1_wind1/1e6,batch1_wind2/1e6,batch2_wind1/1e6,batch2_wind2/1e6,batch1_wind2/1e6-batch1_wind1/1e6,batch2_wind2/1e6-batch2_wind1/1e6))
 
         for i in range(event_size):
             ev_t = t[i]
@@ -3723,11 +3849,11 @@ def dvs_autofocus(events: numpy.ndarray):
             eventstart_time = optimal_focus_time - delta_time
             eventend_time = optimal_focus_time
         else:
-            return optimal_focus_time #,time_start,time_finish
+            return optimal_focus_time,save_time_boundary
 
         counterss+=1
 
-    return optimal_focus_time #,time_start,time_finish
+    return optimal_focus_time,save_time_boundary
 
 def dvs_autofocus_test(events: numpy.ndarray):
 
