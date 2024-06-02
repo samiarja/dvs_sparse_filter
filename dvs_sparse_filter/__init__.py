@@ -53,7 +53,7 @@ import scipy.io as sio
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import colorsys
 import time
-from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve, average_precision_score, mean_squared_error
 from math import exp, isfinite
 from scipy.linalg import expm, lstsq
 from collections import deque
@@ -1159,6 +1159,367 @@ def filter_events(input_events, ground_truth, time_window, method="STCF", save_p
     return output_events, performance if save_performance else output_events
 
 ###########################################################################
+
+def linearClassifier(Xtrain, Ytrain, Xtest,YtestGroundTruth):
+    YtestOutput = weightMapping(Xtrain, Ytrain, Xtest)
+    accuracy, rmse, misclassified_count, YtestOutputMaxed = CalculateClassifierPerformance(Xtrain, Ytrain, Xtest, YtestGroundTruth, YtestOutput)
+    return accuracy, YtestOutputMaxed, YtestOutput
+
+def ELMClassifier(Xtrain, Ytrain, Xtest,YtestGroundTruth,NUM_ELM_SIMULATIONS=10,ELM_hiddenLayerSizes=[50]):
+    ELM_regularizationFactors       = [1e-6]
+    rescaleInputsToNonlinearRegion  = 4
+
+    ELM_accuracyArray = numpy.zeros((len(ELM_hiddenLayerSizes), len(ELM_regularizationFactors), NUM_ELM_SIMULATIONS))
+    ELM_RMSEArray = numpy.zeros_like(ELM_accuracyArray)
+    ELM_resultArray = numpy.empty_like(ELM_accuracyArray, dtype=object)
+
+    for simELMIndex in tqdm(range(NUM_ELM_SIMULATIONS)):
+        for regFacIndex, regFac in enumerate(ELM_regularizationFactors):
+            for hiddenLayerSizeIndex, hiddenLayerSize in enumerate(ELM_hiddenLayerSizes):
+                YtestOutput, hiddenLayerWeights, outputWeights = ELMWeight(Xtrain, Ytrain, Xtest, hiddenLayerSize, rescaleInputsToNonlinearRegion, regFac)
+                accuracy, rmse, misclassified_count, YtestOutputMaxed = CalculateClassifierPerformance(Xtrain, Ytrain, Xtest, YtestGroundTruth, YtestOutput)
+
+                ELM_resultArray[hiddenLayerSizeIndex, regFacIndex, simELMIndex] = {
+                                'ELM_accuracy': accuracy,
+                                'ELM_RMSE': rmse,
+                                'YtestOutputELM': YtestOutput,
+                                'YtestOutputMaxed': YtestOutputMaxed
+                            }
+
+                ELM_accuracyArray[hiddenLayerSizeIndex, regFacIndex, simELMIndex] = accuracy
+                ELM_RMSEArray[hiddenLayerSizeIndex, regFacIndex, simELMIndex] = rmse
+        
+    mean_ELM_accuracies = numpy.mean(ELM_accuracyArray, axis=2)
+    std_ELM_accuracies = numpy.std(ELM_accuracyArray, axis=2)
+    bestHLNsIndex, bestELMRegFactIndex = numpy.unravel_index(numpy.argmax(mean_ELM_accuracies, axis=None), mean_ELM_accuracies.shape)
+    highestMean_ELM_accuracy = mean_ELM_accuracies[bestHLNsIndex, bestELMRegFactIndex]
+    stdOfbestMean_ELM_accuracy = std_ELM_accuracies[bestHLNsIndex, bestELMRegFactIndex]
+    bestELMRegFact = ELM_regularizationFactors[bestELMRegFactIndex]
+    bestHLNs = ELM_hiddenLayerSizes[bestHLNsIndex]
+
+    best_YtestOutputMaxed = ELM_resultArray[bestHLNsIndex, bestELMRegFactIndex, 0]['YtestOutputMaxed']
+    best_YtestOutputProb  = ELM_resultArray[bestHLNsIndex, bestELMRegFactIndex, 0]['YtestOutputELM']
+    return highestMean_ELM_accuracy, stdOfbestMean_ELM_accuracy, best_YtestOutputMaxed, best_YtestOutputProb
+
+def weightMapping(Xtrain, Ytrain, Xtest):
+    regularizationFactor                 = 1e-6
+    testingPresentations, inputChannels  = Xtest.shape
+    XtX = numpy.dot(Xtrain.T, Xtrain) + regularizationFactor * numpy.eye(inputChannels)
+    XtY = numpy.dot(Xtrain.T, Ytrain)
+    linearInputToOutputMapping = numpy.linalg.solve(XtX, XtY).T
+    YtestOutput = numpy.dot(Xtest, linearInputToOutputMapping.T)
+    return YtestOutput
+
+def CalculateClassifierPerformance(Xtrain, Ytrain, Xtest, YtestGroundTruth, YtestOutput):
+    if YtestGroundTruth.shape != YtestOutput.shape:
+        raise ValueError("YtestGroundTruth and YtestOutput must have the same shape")
+
+    testingPresentations, numLabels = YtestGroundTruth.shape
+    misclassified_indices = []
+    misclassified_correct_labels = []
+    misclassified_incorrect_labels = []
+
+    YtestOutputMaxed = numpy.zeros_like(YtestGroundTruth)
+    for pres in range(testingPresentations):
+        maxYtestOutputValue = numpy.max(YtestOutput[pres, :])
+        if numpy.all(YtestOutput[pres, :] == 0):
+            YtestOutputMaxed[pres, :] = numpy.zeros_like(YtestOutput[pres, :])
+        elif numpy.all(YtestOutput[pres, :] == maxYtestOutputValue):
+            YtestOutputMaxed[pres, :] = numpy.ones_like(YtestOutput[pres, :])
+        else:
+            YtestOutputMaxed[pres, :] = (YtestOutput[pres, :] == maxYtestOutputValue).astype(float)
+
+        if not numpy.array_equal(YtestOutputMaxed[pres, :], YtestGroundTruth[pres, :]):
+            misclassified_indices.append(pres)
+            misclassified_correct_labels.append(YtestGroundTruth[pres, :])
+            misclassified_incorrect_labels.append(YtestOutputMaxed[pres, :])
+
+    misclassified_indices = numpy.array(misclassified_indices, dtype=int)
+    misclassified_correct_labels = numpy.array(misclassified_correct_labels, dtype=float)
+    misclassified_incorrect_labels = numpy.array(misclassified_incorrect_labels, dtype=float)
+
+    correctly_labeled_positives_TP = numpy.sum(numpy.logical_and(YtestGroundTruth, YtestOutputMaxed), axis=0)  # TP
+    correctly_labeled_negatives_TN = numpy.sum(numpy.logical_and(~YtestGroundTruth.astype(bool), ~YtestOutputMaxed.astype(bool)), axis=0)  # TN
+
+    actual_positives = numpy.sum(YtestGroundTruth, axis=0)  # TP + FN
+    actual_negatives = numpy.sum(~YtestGroundTruth.astype(bool), axis=0)  # TN + FP
+
+    sensitivity = correctly_labeled_positives_TP / actual_positives  # TP / (TP + FN)
+    specificity = correctly_labeled_negatives_TN / actual_negatives  # TN / (TN + FP)
+    informedness = sensitivity + specificity - 1
+    
+    rmse = numpy.sqrt(mean_squared_error(YtestGroundTruth, YtestOutput))
+    accuracy = (1 - len(misclassified_indices) / testingPresentations) * 100
+
+    return accuracy, rmse, len(misclassified_indices), YtestOutputMaxed
+
+
+def ELMWeight(Xtrain, Ytrain, Xtest, hiddenLayerSize, rescaleInputsToNonlinearRegion, regularizationFactor):
+    inputChannels = Xtrain.shape[1]
+
+    # Initialize hidden layer weights
+    hiddenLayerWeights = numpy.random.rand(inputChannels, hiddenLayerSize) - 0.5
+
+    # Calculate hidden layer outputs for training data
+    hiddenLayerWeightedInputs = Xtrain @ hiddenLayerWeights
+    hiddenLayerOutputs = 1 / (1 + numpy.exp(-rescaleInputsToNonlinearRegion * hiddenLayerWeightedInputs)) - 0.5
+
+    # Calculate output weights
+    hiddenLayerOutputs_T = hiddenLayerOutputs.T
+    outputWeights = numpy.linalg.solve(
+        hiddenLayerOutputs_T @ hiddenLayerOutputs + regularizationFactor * numpy.eye(hiddenLayerSize),
+        hiddenLayerOutputs_T @ Ytrain
+    ).T
+
+    # Calculate hidden layer outputs for test data
+    hiddenLayerWeightedInputsForXtest = Xtest @ hiddenLayerWeights
+    hiddenLayerOutputsForTest = 1 / (1 + numpy.exp(-rescaleInputsToNonlinearRegion * hiddenLayerWeightedInputsForXtest)) - 0.5
+
+    # Calculate YtestOutput
+    YtestOutput = hiddenLayerOutputsForTest @ outputWeights.T
+
+    return YtestOutput, hiddenLayerWeights, outputWeights
+
+
+def viz_LiC_ELM(dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, YtestOutputMaxedLiC,
+                YtestOutputMaxedELM, Ytest, YtestOutputProbLiC, YtestOutputProbELM):
+    if not os.path.exists(f"./output/benchmark/{dataname}"):
+        os.mkdir(f"./output/benchmark/{dataname}")
+    
+    sortIdx = numpy.argsort(tsCoordArraytest.flatten())
+    events = {
+        'x': xCoordArraytest[sortIdx].flatten(),
+        'y': yCoordArraytest[sortIdx].flatten(),
+        't': tsCoordArraytest[sortIdx].flatten(),
+        'yPredLiC': YtestOutputMaxedLiC[[sortIdx],0].flatten().astype(numpy.int32),
+        'yPredELM': YtestOutputMaxedELM[[sortIdx],0].flatten().astype(numpy.int32),
+        'yTest': Ytest[[sortIdx],0].flatten().astype(numpy.int32),
+        'vx_zero': numpy.zeros_like(xCoordArraytest[[sortIdx]]).flatten(),
+        'vy_zero': numpy.zeros_like(yCoordArraytest[[sortIdx]]).flatten(),
+        'yPredLiC_onehot': YtestOutputMaxedLiC,
+        'yPredELM_onehot': YtestOutputMaxedELM,
+        'yPredLiC_prob': YtestOutputProbLiC,
+        'yPredELM_prob': YtestOutputProbELM
+    }
+
+    noise_LiC = numpy.where(events["yPredLiC"] == 1)[0]
+    events_indexed_signal_LiC = {key: value[noise_LiC] for key, value in events.items()}
+
+    signal_ELM = numpy.where(events["yPredELM"] == 1)[0]
+    events_indexed_signal_ELM = {key: value[signal_ELM] for key, value in events.items()}
+
+    numpy.savez(f"./output/benchmark/{dataname}/processed_events", **events)
+
+    ''' This how the data 
+    loaded = np.load(f"./output/benchmark/{dataname}/processed_events.npz")
+    events_loaded = {key: loaded[key] for key in loaded.files}
+    for key in events_loaded:
+        print(f"{key}: {events_loaded[key].shape}")
+    '''
+
+    cumulative_map_object  = accumulate((1280,720),events,(0,0))
+    warped_image_segmentation   = render(cumulative_map_object, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation.save(f"./output/benchmark/{dataname}/all_events_image.png")
+
+    cumulative_map_LiC  = accumulate((1280,720),events_indexed_signal_LiC,(0,0))
+    warped_image_segmentation_LiC   = render(cumulative_map_LiC, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/filtered_events_LiC_signal.png")
+
+    cumulative_map_object_ELM  = accumulate((1280,720),events_indexed_signal_ELM,(0,0))
+    warped_image_segmentation_ELM   = render(cumulative_map_object_ELM, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/filtered_events_ELM_signal.png")
+
+    
+    cumulative_map_LiC, seg_label_LiC   = accumulate_cnt_rgb((1280, 720), events, events["yPredLiC"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_LiC       = rgb_render_advanced(cumulative_map_LiC, seg_label_LiC)
+    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/yPredLiC_labelled_image.png")
+
+    cumulative_map_ELM, seg_label_ELM   = accumulate_cnt_rgb((1280, 720), events, events["yPredELM"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_ELM       = rgb_render_advanced(cumulative_map_ELM, seg_label_ELM)
+    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/yPredELM_labelled_image.png")
+
+    fprLiC, tprLiC, _ = roc_curve(Ytest[:,0], YtestOutputProbLiC[:,0], pos_label=1)
+    fprELM, tprELM, _ = roc_curve(Ytest[:,0], YtestOutputProbELM[:,0], pos_label=1)
+    aucLiC            = roc_auc_score(Ytest[:,0], YtestOutputProbLiC[:,0])
+    aucELM            = roc_auc_score(Ytest[:,0], YtestOutputProbELM[:,0])
+
+    plt.figure(figsize=(12, 6))
+    plt.xlabel('FPR')
+    plt.ylabel('TPR')
+    plt.title(f'roc LiC curve: {aucLiC:.3f}, roc ELM curve: {aucELM:.3f}')
+    plt.plot(fprLiC, tprLiC, color='b', linewidth=1)
+    plt.plot(fprELM, tprELM, color='g', linewidth=1)
+    plt.plot([0, 1], [0, 1], 'r--')
+    plt.legend(["LiC","ELM"])
+    plt.savefig(f"./output/benchmark/{dataname}/roc_curve_LiC_ELM.png")
+
+
+def FEAST_inference(input_events, ground_truth, signalweight, noiseweight):
+    downSampleFactor    = 5
+    tau                 = 1e6
+    beta                = 0.5
+    displayFreq         = 5e5
+    R                   = 5
+    D                   = 2 * R + 1
+    pooling_wind        = 3
+    wFrozen             = numpy.hstack((signalweight['w'], noiseweight['w']))
+    neuron_labels       = numpy.hstack((numpy.ones(signalweight['w'].shape[1]), 
+                                        numpy.zeros(noiseweight['w'].shape[1]))).astype(int)
+    nNeuron             = len(neuron_labels)
+    nTD                 = len(input_events['x'])
+
+    xs = numpy.max(input_events['x']) + 1
+    ys = numpy.max(input_events['y']) + 1
+
+    T = -numpy.inf * numpy.ones((xs, ys))
+    P = numpy.zeros((xs, ys))
+
+    predicted_labels = numpy.full(nTD, numpy.nan)
+    T_F = -numpy.inf * numpy.ones((xs, ys, nNeuron))
+
+    T_Fd = -numpy.inf * numpy.ones((round(xs / downSampleFactor), round(ys / downSampleFactor), nNeuron))
+    P_Fd = numpy.zeros_like(T_Fd)
+    T_FdSimple = T_Fd.copy()
+
+    oneMinusBeta = 1 - beta
+    countArray = numpy.full(nNeuron, 10)
+    X_original = numpy.eye(nTD, pooling_wind * pooling_wind * nNeuron)
+
+    xdMax = xs / downSampleFactor
+    ydMax = ys / downSampleFactor
+
+    Valididx = 0
+    validnewTD0 = 0
+    validnewTD1 = 0
+    newTD0 = []
+    newTD1 = []
+    coordinate = numpy.zeros((nTD, 4))
+    labels = numpy.full_like(input_events['x'], numpy.nan)
+
+    for idx in tqdm(range(nTD)):
+        x = int(input_events['x'][idx])
+        y = int(input_events['y'][idx])
+        xd = round(x / downSampleFactor)
+        yd = round(y / downSampleFactor)
+        p = int(input_events['on'][idx])
+        if p == 0:
+            p = 1
+        t = int(input_events['t'][idx])
+
+        T[x, y] = t
+        P[x, y] = p
+
+        if (x - R > 0) and (x + R < xs) and (y - R > 0) and (y + R < ys):
+            ROI = P[x - R:x + R + 1, y - R:y + R + 1] * numpy.exp((T[x - R:x + R + 1, y - R:y + R + 1] - t) / tau)
+
+            if xd > 1 and yd > 1 and xd < xdMax and yd < ydMax:
+                ROI_norm = ROI / numpy.linalg.norm(ROI, 'fro')
+                dotProds = numpy.sum(wFrozen * ROI_norm.ravel()[:, None], axis=0)
+                winnerNeuron = numpy.argmax(dotProds)
+                Valididx += 1
+
+                countArray[winnerNeuron] += 1
+
+                predicted_labels[Valididx] = neuron_labels[winnerNeuron]
+
+                T_F[x, y, winnerNeuron] = t
+                T_FdSimple[xd, yd, winnerNeuron] = t
+
+                if numpy.isinf(T_FdSimple[xd, yd, winnerNeuron]):
+                    T_FdSimple[xd, yd, winnerNeuron] = t
+                else:
+                    T_FdSimple[xd, yd, winnerNeuron] = oneMinusBeta * T_FdSimple[xd, yd, winnerNeuron] + beta * t
+
+                x_start = max(xd - 1, 0)
+                x_end = min(xd + 2, T_FdSimple.shape[0])
+                y_start = max(yd - 1, 0)
+                y_end = min(yd + 2, T_FdSimple.shape[1])
+
+                T_Fd_featureContext = T_FdSimple[x_start:x_end, y_start:y_end, :]
+
+                if T_Fd_featureContext.shape[0] < 3 or T_Fd_featureContext.shape[1] < 3:
+                    T_Fd_featureContext = numpy.pad(T_Fd_featureContext, 
+                                                 ((0, max(0, 3 - T_Fd_featureContext.shape[0])), 
+                                                  (0, max(0, 3 - T_Fd_featureContext.shape[1])), 
+                                                  (0, 0)), 'constant', constant_values=-numpy.inf)
+
+                S_Fd_featureContext = numpy.exp((T_Fd_featureContext - t) / tau)
+                X_original[Valididx, :] = S_Fd_featureContext.ravel()
+                coordinate[Valididx, 0] = x
+                coordinate[Valididx, 1] = y
+                coordinate[Valididx, 2] = t
+
+                if ground_truth[idx] == 0:
+                    coordinate[Valididx, 3] = 0
+                    validnewTD0 += 1
+                    labels[Valididx] = 0
+
+                elif ground_truth[idx] == 1:
+                    coordinate[Valididx, 3] = 1
+                    validnewTD1 += 1
+                    labels[Valididx] = 1
+
+    where_are_NaNs = numpy.isnan(predicted_labels)
+    predicted_labels[where_are_NaNs] = 0
+    return X_original, coordinate, labels, predicted_labels
+
+
+def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
+    # Extract coordinates and timestamps
+    xCoordArray = coordinate[:, 0]
+    yCoordArray = coordinate[:, 1]
+    tsCoordArray = coordinate[:, 2]
+
+    # Convert X and Y to single precision
+    X = X_original.astype(numpy.float32)
+    Y = labels.astype(numpy.float32)
+
+    # Find indices of NaN values in Y
+    findNaN = numpy.where(numpy.isnan(Y))[0]
+
+    if len(findNaN) > 0:
+        X = X[:findNaN[0], :]
+        Y = Y[:findNaN[0]]
+
+        xCoordArray = xCoordArray[:findNaN[0]]
+        yCoordArray = yCoordArray[:findNaN[0]]
+        tsCoordArray = tsCoordArray[:findNaN[0]]
+
+    nEventAfterSkip = X.shape[0]
+
+    # Shuffle the data
+    shuffledIndex = numpy.random.permutation(nEventAfterSkip)
+    X_shuffled = X[shuffledIndex, :]
+    Y_shuffled = Y[shuffledIndex]
+
+    xCoordArray_shuffle = xCoordArray[shuffledIndex]
+    yCoordArray_shuffle = yCoordArray[shuffledIndex]
+    tsCoordArray_shuffle = tsCoordArray[shuffledIndex]
+
+    # Split into training and test sets
+    splitIndex = int(numpy.floor(nEventAfterSkip * trainTestSplitRatio))
+    
+    Xtrain = X_shuffled[:splitIndex, :]
+    Xtest = X_shuffled[splitIndex:, :]
+
+    Ytrain = Y_shuffled[:splitIndex]
+    Ytest = Y_shuffled[splitIndex:]
+
+    xCoordArraytest = xCoordArray_shuffle[splitIndex:]
+    yCoordArraytest = yCoordArray_shuffle[splitIndex:]
+    tsCoordArraytest = tsCoordArray_shuffle[splitIndex:]
+
+    # Replace NaN values in Ytrain and Ytest with 0
+    Ytrain[numpy.isnan(Ytrain)] = 0
+    Ytest[numpy.isnan(Ytest)] = 0
+
+    # Create the second column for binary classification
+    Ytrain = numpy.column_stack((Ytrain, 1 - Ytrain))
+    Ytest = numpy.column_stack((Ytest, 1 - Ytest))
+
+    return Xtrain, Ytrain, Xtest, Ytest, xCoordArraytest, yCoordArraytest, tsCoordArraytest
+
+
 
 def accumulate4D_placeholder(sensor_size, events, linear_vel, angular_vel, zoom):
     # Placeholder function to simulate accumulate4D.
