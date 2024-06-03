@@ -288,6 +288,106 @@ class CumulativeMap:
 
 
 #####################################################################
+DEFAULT_TIMESTAMP = -1
+class STDFFilter:
+    def __init__(self, chip_size, num_must_be_correlated=3, dt=1e3, subsample_by=0, let_first_event_through=True, filter_hot_pixels=True):
+        self.sx, self.sy = chip_size
+        self.num_must_be_correlated = num_must_be_correlated
+        self.dt = dt
+        self.subsample_by = subsample_by
+        self.let_first_event_through = let_first_event_through
+        self.filter_hot_pixels = filter_hot_pixels
+        self.timestamp_image = numpy.full((self.sx, self.sy), DEFAULT_TIMESTAMP)
+        self.density_matrix = numpy.zeros((self.sx, self.sy, 8), dtype=int)
+        self.total_event_count = 0
+
+    def filter_packet(self, events):
+        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        if self.timestamp_image is None:
+            self.allocate_maps()
+
+        filtered_events = []
+        for i, e in enumerate(events):
+            self.total_event_count += 1
+            ts = e['t']
+            x, y = e['x'] >> self.subsample_by, e['y'] >> self.subsample_by
+
+            if x < 0 or x >= self.sx or y < 0 or y >= self.sy:
+                continue
+
+            if self.timestamp_image[x, y] == DEFAULT_TIMESTAMP:
+                self.timestamp_image[x, y] = ts
+                if self.let_first_event_through:
+                    filtered_events.append(e)
+                continue
+
+            ncorrelated = 0
+            for eid in range(7, 0, -1):
+                self.density_matrix[x, y, eid] = self.density_matrix[x, y, eid - 1]
+
+            self.density_matrix[x, y, 0] = ts
+            for eid in range(1, 8):
+                eid_ts = self.density_matrix[x, y, eid]
+                delta_t = ts - eid_ts
+                if delta_t > self.dt:
+                    self.density_matrix[x, y, eid] = 0
+
+            for xx in range(x - 2, x + 3):
+                for yy in range(y - 2, y + 3):
+                    if xx < 0 or xx >= self.sx or yy < 0 or yy >= self.sy:
+                        continue
+                    if self.filter_hot_pixels and xx == x and yy == y:
+                        continue
+
+                    last_t = self.timestamp_image[xx, yy]
+                    delta_t = ts - last_t
+                    if delta_t < self.dt and last_t != DEFAULT_TIMESTAMP:
+                        ncorrelated += 1
+                        for k in range(1, 8):
+                            last_t2 = self.density_matrix[xx, yy, k]
+                            if last_t2 == 0:
+                                break
+                            delta_t2 = ts - last_t2
+                            if delta_t2 < self.dt:
+                                ncorrelated += 1
+                                if ncorrelated >= self.num_must_be_correlated:
+                                    break
+
+            if ncorrelated >= self.num_must_be_correlated:
+                filtered_events.append(e)
+            else:
+                boolean_mask[i] = True
+            self.timestamp_image[x, y] = ts
+
+        filtered_events = numpy.array(filtered_events, dtype=events.dtype)
+        return boolean_mask, filtered_events
+
+    def reset_filter(self):
+        self.timestamp_image.fill(DEFAULT_TIMESTAMP)
+        self.density_matrix.fill(0)
+
+    def init_filter(self, chip_size):
+        self.sx, self.sy = chip_size
+        self.reset_filter()
+
+    def allocate_maps(self):
+        self.timestamp_image = numpy.full((self.sx, self.sy), DEFAULT_TIMESTAMP)
+        self.density_matrix = numpy.zeros((self.sx, self.sy, 8), dtype=int)
+
+    def initialize_last_times_map_for_noise_rate(self, noise_rate_hz, last_timestamp_us):
+        random.seed()
+        for array_row in range(self.sx):
+            for i in range(self.sy):
+                p = random.random()
+                t = -noise_rate_hz * numpy.log(1 - p)
+                t_us = int(1000000 * t)
+                self.timestamp_image[array_row, i] = last_timestamp_us - t_us
+
+    def set_num_must_be_correlated(self, num_must_be_correlated):
+        self.num_must_be_correlated = max(1, min(num_must_be_correlated, 9))
+
+
+
 class InceptiveFilter:
     def __init__(self, multiTriggerWindow):
         self.multiTriggerWindow = multiTriggerWindow
@@ -951,6 +1051,8 @@ def CrossConv(input_events, ground_truth, time_window):
         label_hotpix |= (y == xi) & (x == yi)
     label_hotpix_binary = label_hotpix.astype(int)
 
+    print(f'Number of input event: {len(input_events["x"])}')
+
     jj              = numpy.where(label_hotpix_binary==0)[0]
     output_events   = input_events[jj]
 
@@ -973,6 +1075,8 @@ def STCF(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
+    print(f'Number of input event: {len(input_events["x"])}')
+
     filter_instance             = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max)
     boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
@@ -994,6 +1098,8 @@ def DFWF(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
     
+    print(f'Number of input event: {len(input_events["x"])}')
+
     filter_instance             = DoubleFixedWindowFilter(sx=x_max, sy=y_max)
     boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
@@ -1013,6 +1119,8 @@ def TS(input_events, ground_truth, time_window):
     ground_truth = ground_truth[ii]
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    print(f'Number of input event: {len(input_events["x"])}')
 
     time_surface_filter = TimeSurfaceFilter(resolution=(x_max, y_max))
     boolean_mask, output_events = time_surface_filter << input_events
@@ -1035,6 +1143,8 @@ def YNoise(input_events, ground_truth, time_window):
     ground_truth = ground_truth[ii]
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    print(f'Number of input event: {len(input_events["x"])}')
 
     yang_noise_filter             = YangNoiseFilter(resolution=(x_max, y_max))
     boolean_mask, output_events = yang_noise_filter << input_events
@@ -1059,6 +1169,8 @@ def KNoise(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
+    print(f'Number of input event: {len(input_events["x"])}')
+
     khodamoradi_noise             = KhodamoradiNoiseFilter(resolution=(x_max, y_max))
     boolean_mask, output_events = khodamoradi_noise << input_events
 
@@ -1081,6 +1193,8 @@ def EvFlow(input_events, ground_truth, time_window):
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
 
+    print(f'Number of input event: {len(input_events["x"])}')
+
     event_flow                  = EventFlowFilter(resolution=(x_max, y_max))
     boolean_mask, output_events = event_flow << input_events
 
@@ -1097,12 +1211,14 @@ def EvFlow(input_events, ground_truth, time_window):
 def IETS(input_events, ground_truth, time_window):
     print("Start processing IETS filter...")
 
-    # ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
-    ii = numpy.where(numpy.logical_and(input_events["t"] > 0, input_events["t"] < 5e6))
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    # ii = numpy.where(numpy.logical_and(input_events["t"] > 0, input_events["t"] < time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
     x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    print(f'Number of input event: {len(input_events["x"])}')
 
     multiTriggerWindow = 2e6
     inceptive_filter = InceptiveFilter(multiTriggerWindow)
@@ -1110,13 +1226,13 @@ def IETS(input_events, ground_truth, time_window):
 
     output_events = input_events[~detected_noise]
 
-    warped_image = accumulate((1280,720), input_events, (0, 0))
-    rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    rendered_image.show()  
+    # warped_image = accumulate((1280,720), input_events, (0, 0))
+    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    # rendered_image.show()  
 
-    warped_image = accumulate((1280,720), output_events, (0, 0))
-    rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    rendered_image.show()  
+    # warped_image = accumulate((1280,720), output_events, (0, 0))
+    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    # rendered_image.show()  
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
@@ -1128,14 +1244,35 @@ def IETS(input_events, ground_truth, time_window):
     return output_events, performance
 
 
-def MLPF(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "MLPF performance metrics"
-    return output_events, performance
+def STDF(input_events, ground_truth, time_window):
+    print("Start processing STDF filter...")
 
-def deFEAST(input_events, ground_truth, time_window):
-    output_events = input_events  # Replace with actual processing
-    performance = "deFEAST performance metrics" 
+    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+
+    print(f'Number of input event: {len(input_events["x"])}')
+
+    stdf = STDFFilter((x_max, y_max), num_must_be_correlated=3, dt=50000)
+    boolean_mask, output_events = stdf.filter_packet(input_events)
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+
+    detected_noise = boolean_mask.astype(int)
+    
+    # warped_image = accumulate((1280,720), input_events, (0, 0))
+    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    # rendered_image.show()  
+
+    # warped_image = accumulate((1280,720), output_events, (0, 0))
+    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
+    # rendered_image.show()  
+
+    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
+    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+
     return output_events, performance
 
 
