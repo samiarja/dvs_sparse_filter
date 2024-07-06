@@ -20,7 +20,7 @@ import astropy.units as u
 from skimage.color import rgb2gray
 import io
 import matplotlib.cm as cm
-from matplotlib.patches import RegularPolygon, Ellipse, Circle
+from matplotlib.patches import RegularPolygon, Ellipse, Circle, Polygon
 import PIL.Image
 import PIL.ImageChops
 import PIL.ImageDraw
@@ -72,6 +72,37 @@ from astropy.visualization.wcsaxes import WCSAxes
 from astroquery.gaia import Gaia
 astrometry.SolutionParameters
 
+petroff_colors_6 = [
+    "#5790fc",
+    "#f89c20",
+    "#e42536",
+    "#964a8b",
+    "#9c9ca1",
+    "#7a21dd",
+]
+petroff_colors_8 = [
+    "#1845fb",
+    "#ff5e02",
+    "#c91f16",
+    "#c849a9",
+    "#adad7d",
+    "#86c8dd",
+    "#578dff",
+    "#656364",
+]
+petroff_colors_10 = [
+    "#3f90da",
+    "#ffa90e",
+    "#bd1f01",
+    "#94a4a2",
+    "#832db6",
+    "#a96b59",
+    "#e76300",
+    "#b9ac70",
+    "#717581",
+    "#92dadd",
+]
+
 
 def print_message(message, color='default', style='normal'):
     styles = {
@@ -103,6 +134,16 @@ def read_es_file(
             numpy.concatenate([packet for packet in decoder]),
         )
 
+
+def write_es_file(
+    path: typing.Union[pathlib.Path, str],
+    event_type: str,
+    width: int,
+    height: int,
+    events: numpy.ndarray
+) -> None:
+    with event_stream.Encoder(path, event_type, width, height) as encoder:
+        encoder.write(events)
 
 def read_h5_file(
     path: typing.Union[pathlib.Path, str]
@@ -1043,7 +1084,7 @@ def CrossConv(input_events, ground_truth, time_window):
     shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
     max_shifted = numpy.maximum.reduce(shifted)
     ratios = event_count / (max_shifted + 1.0)
-    smart_mask = ratios < 1.0 #this should be 2 ideally
+    smart_mask = ratios < 2.0 #this should be 2 ideally
 
     yhot, xhot      = numpy.where(~smart_mask)
     label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
@@ -2139,6 +2180,551 @@ def display_img_sources(source_extraction_img_path, regions, intensity_img, img_
     # Save the image
     intensity_img_pil.save(source_extraction_img_path, "PNG")
 
+
+def detect_sources_cca(warped_accumulated_frame):
+    """
+    Detects sources in an image and filters them based on their properties.
+    :param warped_accumulated_frame: PIL Image of the input image.
+    :param filtered_image_path: Path where the filtered image will be saved.
+    :return: Tuple of sources, source_positions, focus_frame_mask, filtered_warped_image, and focus_frame_mask_labelled
+    """
+    image_np = numpy.array(warped_accumulated_frame)
+    
+    # Convert to grayscale for processing
+    if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+        gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray_image = image_np
+
+    # Apply Gaussian blur
+    blurred_image = cv2.GaussianBlur(gray_image, (15, 15), 0) #(13,13)
+    
+    # Threshold the image
+    _, thresh_image = cv2.threshold(blurred_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Morphological operations
+    kernel = numpy.ones((3, 3), numpy.uint8)
+    closed = cv2.morphologyEx(thresh_image, cv2.MORPH_CLOSE, kernel, iterations=3)
+    
+    # Label connected components
+    label_image = measure.label(closed)
+    regions = measure.regionprops(label_image=label_image, intensity_image=closed)
+    
+    filtered_regions = [region for region in regions if region.area > 1]
+    print(f'Removed {len(regions)-len(filtered_regions)} of {len(regions)} sources, {len(filtered_regions)} sources remaining')
+    
+    sources = sorted(filtered_regions, key=lambda x: x.area, reverse=True)
+    brightest_sources = sources[:1000]
+    brightest_source_positions = [region.centroid for region in brightest_sources]
+    source_positions = [region.centroid for region in filtered_regions]
+    
+    # Prepare to draw circles on the original image using PIL
+    output_image = warped_accumulated_frame.copy()
+    draw = ImageDraw.Draw(output_image)
+    
+    # Draw circles on the original image using PIL
+    for centroid in source_positions:
+        cx, cy = int(centroid[1]), int(centroid[0])  # Swap x and y for image coordinates
+        draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], outline=(0, 255, 0), width=3)
+    
+    # Save the modified image using PIL to maintain original format and color space
+    # output_image.save(filtered_image_path)
+    filtered_warped_image = output_image
+    
+    return sources, brightest_source_positions, closed, filtered_warped_image, label_image
+
+
+def cone_search_gaia(ra, dec, search_radius):
+    # Perform a cone search for the whole field with a radius of 1 degree
+    radius = search_radius * u.degree
+    Gaia.ROW_LIMIT = 100000
+    field_centre_ra = ra
+    field_centre_dec = dec
+    field_centre_coord = SkyCoord(ra=field_centre_ra, dec=field_centre_dec, unit=(u.deg, u.deg), frame='icrs')
+    print(f'Cone searching GAIA for {Gaia.ROW_LIMIT} sources in radius {radius} (deg) around field centre {field_centre_ra}, {field_centre_dec}')
+    job = Gaia.cone_search_async(coordinate=field_centre_coord, radius=radius)
+    gaia_sources = job.get_results()
+    return gaia_sources
+
+def associate_sources_new(sources_calibrated, solution, wcs_calibration, gaia_sources, results_folder_method, save_fig=True):
+
+    #need to search for every source, not just the ones from the brightest sources sublist or the matching sources sublist
+    sources_ra = [source['centroid_radec_deg'][0][0] for source in sources_calibrated['sources_astro']]
+    sources_dec = [source['centroid_radec_deg'][0][1] for source in sources_calibrated['sources_astro']]
+
+    filtered_gaia_sources = []
+    for filtered_source in gaia_sources:
+        # for gaia_source in gaia_sources:
+        position_pix = wcs_calibration.all_world2pix(filtered_source['ra'], filtered_source['dec'], 0) 
+        # print(position_pix)
+        if 0 < position_pix[0] < 1280 and 0 < position_pix[1] < 720:
+                filtered_gaia_sources.append(filtered_source['phot_g_mean_mag'])
+
+    # Create a list of SkyCoord objects for detected source positions
+    source_coords = SkyCoord(ra=sources_ra, dec=sources_dec, unit=(u.degree, u.degree), frame='icrs')
+    gaia_source_coords = SkyCoord(ra=gaia_sources['ra'], dec=gaia_sources['dec'], unit=(u.deg, u.deg), frame='icrs')
+    all_gaia_mags = [source['phot_g_mean_mag'] for source in gaia_sources]
+    
+    # Loop through each source and find the closest match locally
+    match_idxs, d2d, _ = match_coordinates_sky(source_coords, gaia_source_coords, nthneighbor=1)
+    # match_idxs, d2d, _ = match_coordinates_sky(source_coords, SkyCoord(ra=filtered_gaia_source_ra, dec=filtered_gaia_source_dec, unit=(u.deg, u.deg), frame='icrs'), nthneighbor=1)
+    duplicate_indices = numpy.where(numpy.bincount(match_idxs) > 1)[0]
+
+    match_mags = []
+
+    #update all sources with associated astrophyisical characteristics of the matching astrometric source
+    for i, match_idx in enumerate(match_idxs):
+            closest_source = gaia_sources[match_idx]
+            position_pix = wcs_calibration.all_world2pix(closest_source['ra'], closest_source['dec'], 0)
+
+            sources_calibrated['sources_astro'][i]['matching_source_ra'] = closest_source['ra']
+            sources_calibrated['sources_astro'][i]['matching_source_dec'] = closest_source['dec']
+            sources_calibrated['sources_astro'][i]['matching_source_x'] = (position_pix[0])
+            sources_calibrated['sources_astro'][i]['matching_source_y'] = (position_pix[1])
+            sources_calibrated['sources_astro'][i]['match_error_arcsec'] = d2d[i].arcsecond
+            sources_calibrated['sources_astro'][i]['match_error_pix'] = d2d[i].arcsecond / solution.best_match().scale_arcsec_per_pixel
+            sources_calibrated['sources_astro'][i]['mag'] = closest_source['phot_g_mean_mag']
+            # sources_calibrated['sources_astro'][i]['ID'] = closest_source['source_id']
+
+            match_mags.append(closest_source['phot_g_mean_mag'])
+
+            #check to make sure that the associated source is actually within the image, and store if so
+            if 0 < position_pix[0] < 720 and 0 < position_pix[1] < 1280:
+                sources_calibrated['sources_astro'][i]['match_in_fov'] = True
+            else:
+                sources_calibrated['sources_astro'][i]['match_in_fov'] = False
+
+            #flag duplicates 
+            if i in duplicate_indices:
+                sources_calibrated['sources_astro'][i]['duplicate'] = True
+            else:
+                sources_calibrated['sources_astro'][i]['duplicate'] = False
+
+    low_error_associated_sources =  [source['match_error_pix'] for source in sources_calibrated['sources_astro'] if source['match_error_pix'] <= 3]
+    sources_calibrated['num_good_associated_sources_astro'] = len(low_error_associated_sources)
+    print(f'min mag: {numpy.min(match_mags)}')
+
+
+    filtered_mags = [source['mag'] for source in sources_calibrated['sources_astro'] if source['duplicate'] == False]
+
+    range_of_interest = (5, 16)
+    hist_data, bin_edges = numpy.histogram(filtered_mags, bins=100, range=range_of_interest)
+    gaia_hist_data, _ = numpy.histogram(filtered_gaia_sources, bins=100, range=range_of_interest)
+
+    # Find the maximum occurrence (height of the tallest bin) within the specified range
+    max_occurrence = max(hist_data.max(), gaia_hist_data.max())
+
+    # Plot the histograms
+    plt.hist(filtered_mags, bins=100, alpha=0.95, edgecolor='green', histtype='step', label='Detected Sources', range=range_of_interest)
+    plt.hist(filtered_gaia_sources, bins=100, alpha=0.95, edgecolor='orange', histtype='step', label='Catalogue Sources', range=range_of_interest)
+
+    plt.ylabel('Occurrences')
+    plt.xlabel('G-Band Magnitude')
+    plt.xlim(range_of_interest)
+    # Adjust the ylim based on the maximum occurrence, adding some padding for visual clarity
+    plt.ylim([0, max_occurrence + max_occurrence * 0.1])  # Adding 10% padding
+
+    plt.axvline(x=14.45, color='magenta', linestyle='--', label='Previously reported\nmag limit\n(Ralph et al. 2022)')
+    plt.grid('on')
+    plt.legend()
+
+    if save_fig: plt.savefig(f'{results_folder_method}/15_histogram_of_star_magnitudes.png')
+    # plt.show()
+    return sources_calibrated
+
+
+def astrometric_calibration_new(source_pix_positions, centre_ra, centre_dec):
+
+    #parse to astrometry with priors on pixel scale and centre, then get matches
+    # logging.getLogger().setLevel(logging.INFO)
+
+    #number of sources to input for calibration, usually take the first 20 (brightest since sorted)
+    number_sources_to_calibrate_from = min(100, len(source_pix_positions))
+    
+    if number_sources_to_calibrate_from > 0:
+
+        solver = astrometry.Solver(
+            astrometry.series_5200_heavy.index_files(
+                cache_directory="./astrometry_cache",
+                scales={5},
+            )
+        )
+        solution = solver.solve(
+            stars=source_pix_positions[0:number_sources_to_calibrate_from],
+            # size_hint=None, 
+            # position_hint=None,
+            size_hint=astrometry.SizeHint(
+                lower_arcsec_per_pixel=1.0,
+                upper_arcsec_per_pixel=2.0,
+            ),
+            position_hint=astrometry.PositionHint(
+                ra_deg = centre_ra,
+                dec_deg = centre_dec,
+                radius_deg = 3, #1 is good, 3 also works, trying 5
+            ),
+            solution_parameters=astrometry.SolutionParameters(
+            tune_up_logodds_threshold=None, # None disables tune-up (SIP distortion)
+            output_logodds_threshold=14.0, #14.0 good, andre uses 1.0
+            # logodds_callback=logodds_callback
+            logodds_callback=lambda logodds_list: astrometry.Action.CONTINUE #CONTINUE or STOP
+            )
+        )
+        
+
+        if solution.has_match():
+            detected_sources = {'pos_x':[], 'pos_y':[]}
+            print('Solution found')
+            print(f'Centre ra, dec: {solution.best_match().center_ra_deg=}, {solution.best_match().center_dec_deg=}')
+            print(f'Pixel scale: {solution.best_match().scale_arcsec_per_pixel=}')
+            print(f'Number of sources found: {len(solution.best_match().stars)}')
+
+            wcs_calibration = astropy.wcs.WCS(solution.best_match().wcs_fields)
+            pixels = wcs_calibration.all_world2pix([[star.ra_deg, star.dec_deg] for star in solution.best_match().stars],0,)
+
+            for idx, star in enumerate(solution.best_match().stars):
+                detected_sources['pos_x'].append(pixels[idx][0])
+                detected_sources['pos_y'].append(pixels[idx][1])
+
+        else:
+            print(f'\n *** No astrometric solution found ***')
+            detected_sources = None
+            wcs_calibration = None
+
+    else:
+        print(f'\n *** No astrometric solution found, too few input sources ***')
+        detected_sources = None
+        wcs_calibration = None
+        solution = None
+
+    return solution, detected_sources, wcs_calibration
+
+def run_astrometry_new(sources, source_positions, centre_ra, centre_dec, gaia_sources, results_folder_method):
+
+    print(f'Astrometrically calibrating field centred at {centre_ra}, {centre_dec}')
+    solution, detected_sources, wcs_calibration = astrometric_calibration_new(source_positions, centre_ra, centre_dec)
+    sources_calibrated = None
+    
+    if solution is not None:
+        if solution.has_match():
+            #main container, list of the two pixel and astro/wcs space source entries (dicts)
+            sources_calibrated = {'sources_pix':[], 'sources_astro':[]}
+
+            #convert region props object to dict
+            for source in sources:
+                source_info = {attr: getattr(source, attr) for attr in dir(source)}
+                sources_calibrated['sources_pix'].append(source_info)
+
+            #make an astro source entry for each source
+            for idx, source in enumerate(sources_calibrated['sources_pix']):
+                source_astro = {'astro_ID':None, 'centroid_radec_deg':None, 'mag':None}
+                source_astro['centroid_radec_deg'] = wcs_calibration.all_pix2world([sources_calibrated['sources_pix'][idx]['centroid_weighted']], 0,)
+                sources_calibrated['sources_astro'].append(source_astro)
+
+            #find matching astrophysical sources for each detected source in the pixel space
+            print('Searching GAIA for associated astrophyical sources')
+            sources_calibrated = associate_sources_new(sources_calibrated, solution, wcs_calibration, gaia_sources, results_folder_method, save_fig=True)
+
+            sources_calibrated['pixel_scale_arcsec'] = solution.best_match().scale_arcsec_per_pixel
+            sources_calibrated['field_centre_radec_deg'] = [solution.best_match().center_ra_deg, solution.best_match().center_dec_deg]
+            sources_calibrated['wcs'] = wcs_calibration
+            sources_calibrated['detected_sources_pix'] = len(sources_calibrated['sources_pix'])
+    
+    return sources_calibrated, detected_sources, wcs_calibration
+
+
+
+def display_astro_matches(input_img, detected_sources, sources_calibrated, source_positions, wcs_calibration, results_filename, save_fig=False):
+    plt.figure(figsize=(12, 7))
+    plt.title('Comparison of input brightest detected sources (magenta) with astometric calibrated and associated sources (cyan)',fontsize=10)
+    plt.imshow(input_img, vmin=0, vmax=3)
+    plt.xlabel('X (pix)')
+    plt.ylabel('Y (pix)')
+
+    for source in source_positions:
+        circle = Circle((int(source[1]), int(source[0])), color='magenta', radius=7.5, fill=False,alpha=0.65)
+        plt.gca().add_patch(circle)
+
+    for idx in range(len(detected_sources['pos_x'])):
+        circle = Circle((int(detected_sources['pos_y'][idx]), int(detected_sources['pos_x'][idx])), color='cyan', radius=7.5, fill=False,alpha=0.65)
+        plt.gca().add_patch(circle)
+
+    plt.grid(color='white', linestyle='dotted', alpha=0.7)
+    plt.tight_layout()
+    if save_fig: plt.savefig(f'{results_filename}/3_astro_input_sources_vs_matched_astrometry.png')
+    # plt.show()
+
+
+    # Plotting the image with WCS axis
+    fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': wcs_calibration})
+    ax.set_title('Comparison of all detected sources (magenta) with associated astrophysical sources (cyan)')
+
+    # Make the x-axis (RA) tick intervals and grid dense
+    ax.coords[0].set_ticks(spacing=0.1*u.deg, color='white', size=6)
+    ax.coords[0].grid(color='white', linestyle='solid', alpha=0.7)
+    # Customize the y-axis (Dec) tick intervals and labels
+    ax.coords[1].set_ticks(spacing=0.1*u.deg, color='white', size=6)
+    ax.coords[1].grid(color='white', linestyle='solid', alpha=0.7)
+
+    # Set the number of ticks and labels for the y-axis
+    ax.coords[1].set_ticks(number=10)
+    ax.set_xlabel('Right Ascention (ICRS deg)')
+    ax.set_ylabel('Declination (ICRS deg)')
+
+    # Display the image
+    im = ax.imshow(input_img, origin='lower', cmap='viridis', vmin=0, vmax=3)
+
+    for source in sources_calibrated['sources_pix']:
+        circle = Circle((source['centroid_weighted'][1], source['centroid_weighted'][0]), color='magenta', radius=3, fill=False,alpha=0.5)
+        ax.add_patch(circle)
+
+    for source in sources_calibrated['sources_astro']:
+        circle = Circle((source['matching_source_y'], source['matching_source_x']), color='cyan', radius=7.5, fill=False,alpha=0.5)
+        ax.add_patch(circle)
+
+    plt.tight_layout()
+    if save_fig: plt.savefig(f'{results_filename}/4_astro_detected_vs_matched_from_gaia.png')
+    # plt.show()
+
+    #*******************************************************************************************
+
+    #scatter all sources detected and catalogued in image
+    plt.figure(figsize=(12, 7))
+    plt.title('Comparison of input brightest detected sources (magenta) with astometric calibrated and associated sources (cyan)',fontsize=10)
+    # plt.imshow(input_img, vmin=0, vmax=3)
+    plt.xlabel('X (pix)')
+    plt.ylabel('Y (pix)')
+    plt.axvline(x=0, color='magenta', linestyle='--')
+    plt.axvline(x=1280, color='magenta', linestyle='--')
+    plt.axhline(y=0, color='magenta', linestyle='--')
+    plt.axhline(y=720, color='magenta', linestyle='--')
+
+    catalog_sources_x = [source['centroid_weighted'][0] for source in sources_calibrated['sources_pix']]
+    catalog_sources_y = [source['centroid_weighted'][1] for source in sources_calibrated['sources_pix']]
+
+    detected_sources_x = [source['matching_source_x'] for source in sources_calibrated['sources_astro']]
+    detected_sources_y = [source['matching_source_y'] for source in sources_calibrated['sources_astro']]
+
+    plt.scatter(catalog_sources_y, catalog_sources_x)
+    plt.scatter(detected_sources_y, detected_sources_x)
+    plt.grid(color='white', linestyle='solid', alpha=0.7)
+    plt.tight_layout()
+    
+    if save_fig: plt.savefig(f'{results_filename}/5_astro_input_sources_vs_matched_astrometry.png')
+    # plt.show()
+
+    #*******************************************************************************************
+
+    # Plotting the image with WCS axis with source mags
+    fig, ax = plt.subplots(figsize=(24, 16), subplot_kw={'projection': wcs_calibration})
+    ax.set_title('Comparison of all detected sources (magenta) with associated astrophysical sources (cyan) and mags',fontsize=10)
+
+    # Make the x-axis (RA) tick intervals and grid dense
+    ax.coords[0].set_ticklabel(size=20, weight='bold', color='black')
+    ax.coords[0].set_ticks(spacing=0.1*u.deg, color='white', size=6)
+    ax.coords[0].grid(color='white', linestyle='solid', alpha=0.7)
+    # Customize the y-axis (Dec) tick intervals and labels
+    ax.coords[1].set_ticklabel(size=20, weight='bold', color='black')
+    ax.coords[1].set_ticks(spacing=0.1*u.deg, color='white', size=6)
+    ax.coords[1].grid(color='white', linestyle='solid', alpha=0.7)
+
+    # Set the number of ticks and labels for the y-axis
+    ax.coords[1].set_ticks(number=10)
+    ax.set_xlabel('Right Ascention (ICRS deg)', fontsize=18, fontweight='bold')
+    ax.set_ylabel('Declination (ICRS deg)', fontsize=18, fontweight='bold')
+
+    # Display the image
+    im = ax.imshow(input_img, origin='lower', cmap='viridis', vmin=0, vmax=3)
+
+    max_radius = 20  # Maximum radius for the brightest sources
+    min_radius = 3   # Minimum radius for the dimmest sources
+
+    mag_min = numpy.min([source['mag'] for source in sources_calibrated['sources_astro']])
+    mag_max = numpy.max([source['mag'] for source in sources_calibrated['sources_astro']])
+
+    # Calculate the radius inversely proportional to the magnitude
+    for source in sources_calibrated['sources_astro']:
+        center_x = source['matching_source_y']
+        center_y = source['matching_source_x']
+        
+        # Normalize magnitude between 0 and 1, then invert the scale for radius calculation
+        normalized_mag = (source['mag'] - mag_min) / (mag_max - mag_min)
+        radius = (1 - normalized_mag) * (max_radius - min_radius) + min_radius
+            
+        # Generate hexagon points
+        num_vertices = 6
+        angle = numpy.linspace(0, 2 * numpy.pi, num_vertices, endpoint=False)
+        hexagon = numpy.array([[center_x + radius * numpy.cos(a), center_y + radius * numpy.sin(a)] for a in angle])
+            
+        # Create and add hexagon patch
+        hexagon_patch = Polygon(hexagon, closed=True, color='red', fill=False, alpha=1.0, linewidth=2)
+        ax.add_patch(hexagon_patch)
+
+        # Add magnitude text label
+        ax.text(center_x + 1, center_y + 1, str(numpy.round(source['mag'], 2)), color='yellow', va='bottom')
+
+    plt.tight_layout()
+    if save_fig: plt.savefig(f'{results_filename}/6_astro_matched_from_gaia_labelled.png')
+    # plt.show()
+
+    #*******************************************************************************************
+    fig, ax = plt.subplots(figsize=(24, 16), subplot_kw={'projection': wcs_calibration})
+    ax.set_title('Comparison of all detected sources (magenta) with associated astrophysical sources (cyan) and mags', fontsize=24, fontweight='bold')
+
+    # Customize RA and Dec axes
+    ax.coords[0].set_ticklabel(size=20, weight='bold', color='black')
+    ax.coords[0].set_ticks(spacing=0.1*u.deg, color='white', size=16)
+    ax.coords[0].grid(color='white', linestyle='solid', alpha=0.7)
+    ax.coords[1].set_ticklabel(size=20, weight='bold', color='black')
+    ax.coords[1].set_ticks(spacing=0.1*u.deg, color='white', size=16)
+    ax.coords[1].grid(color='white', linestyle='solid', alpha=0.7)
+    ax.coords[1].set_ticks(number=10)
+    ax.set_xlabel('Right Ascention (ICRS deg)', fontsize=18, fontweight='bold')
+    ax.set_ylabel('Declination (ICRS deg)', fontsize=18, fontweight='bold')
+
+    im = ax.imshow(input_img, origin='lower', cmap='viridis', vmin=0, vmax=3)
+
+    # Normalize magnitude for alpha calculation
+    max_radius = 20  # Maximum radius for the brightest sources
+    min_radius = 3   # Minimum radius for the dimmest sources
+
+    mag_min = numpy.min([source['mag'] for source in sources_calibrated['sources_astro']])
+    mag_max = numpy.max([source['mag'] for source in sources_calibrated['sources_astro']])
+
+    # Calculate the radius inversely proportional to the magnitude
+    for source in sources_calibrated['sources_astro']:
+        if 0 <= source['mag'] <= 16:  # Only process sources within the specified magnitude range
+            center_x = source['matching_source_y']
+            center_y = source['matching_source_x']
+            
+            # Normalize magnitude between 0 and 1, then invert the scale for radius calculation
+            normalized_mag = (source['mag'] - mag_min) / (mag_max - mag_min)
+            radius = (1 - normalized_mag) * (max_radius - min_radius) + min_radius
+            
+            # Generate hexagon points
+            num_vertices = 6
+            angle = numpy.linspace(0, 2 * numpy.pi, num_vertices, endpoint=False)
+            hexagon = numpy.array([[center_x + radius * numpy.cos(a), center_y + radius * numpy.sin(a)] for a in angle])
+            
+            # Create and add hexagon patch
+            hexagon_patch = Polygon(hexagon, closed=True, color='red', fill=False, alpha=1.0, linewidth=2)
+            ax.add_patch(hexagon_patch)
+
+            # Add magnitude text label
+            ax.text(center_x + 1, center_y + 1, str(numpy.round(source['mag'], 2)), color='yellow', va='bottom')
+
+    plt.tight_layout()
+    plt.savefig(f'{results_filename}/7_astro_matched_from_gaia_labelled.png')
+    # plt.show()
+
+    #*******************************************************************************************
+
+    plt.figure(figsize=(12, 7))
+    plt.title('Focused comparison of all detected sources (magenta) with associated astrophysical sources (cyan)',fontsize=10)
+    plt.imshow(input_img, vmin=0, vmax=1)
+    plt.xlim([600, 700])
+    plt.ylim([300, 400])
+    plt.xlabel('X (pix)')
+    plt.ylabel('Y (pix)')
+
+    for source in sources_calibrated['sources_pix']:
+        circle = Circle((source['centroid_weighted'][1], source['centroid_weighted'][0]), color='magenta', radius=1.5, fill=False,alpha=0.5)
+        plt.gca().add_patch(circle)
+
+    for source in sources_calibrated['sources_astro']:
+        circle = Circle((source['matching_source_y'], source['matching_source_x']), color='cyan', radius=2, fill=False,alpha=0.5)
+        plt.gca().add_patch(circle)
+
+    plt.grid(color='white', linestyle='solid', alpha=0.7)
+    plt.tight_layout()
+    if save_fig: plt.savefig(f'{results_filename}/8_centre_crop-astro_detected_vs_matched_from_gaia.png')
+    # plt.show()
+
+    #*******************************************************************************************
+    mags = [source['mag'] for source in sources_calibrated['sources_astro']]
+    # Set matplotlib style and figure parameters
+    plt.style.use("default")
+    plt.rcParams["figure.figsize"] = [16, 10]
+    plt.rcParams["font.size"] = 20
+    # Create a figure and subplot
+    figure, subplot = plt.subplots(nrows=1, ncols=1, constrained_layout=True)
+    # Define window size and create a Hamming window
+    window_size = 10
+    window = scipy.signal.windows.hamming(window_size * 2 + 1)
+    window /= numpy.sum(window)
+    # Initialize true positives and match distances
+    true_positives = numpy.zeros(len(source_positions), dtype=numpy.float64)
+    match_distances = numpy.full(len(source_positions), numpy.nan, dtype=numpy.float64)
+    # Calculate distances and find matches
+    for index, gaia_pixel_position in enumerate(source_positions):
+        distances = numpy.hypot(numpy.array(detected_sources["pos_x"]) - gaia_pixel_position[0], 
+                            numpy.array(detected_sources["pos_y"]) - gaia_pixel_position[1])
+        closest = numpy.argmin(distances)
+        if distances[closest] <= 1.0:  # Tolerance for match
+            true_positives[index] = 1.0
+            match_distances[index] = distances[closest]
+
+    # Calculate recall using convolution
+    recall = scipy.signal.convolve(numpy.concatenate((numpy.repeat(true_positives[0], window_size), true_positives, numpy.repeat(true_positives[-1], window_size))), window, mode="valid")
+
+    # Plot recall curve against magnitudes
+    subplot.plot(numpy.sort(mags), recall, c=petroff_colors_6[0], linestyle="-", linewidth=3.0)
+    subplot.axhline(y=0.5, color="#000000", linestyle="--")
+    subplot.set_xticks(numpy.arange(5, 19), minor=False)
+    subplot.set_yticks(numpy.linspace(0.0, 1.0, 11, endpoint=True), minor=False)
+    subplot.set_xlim(left=5.0, right=18.5)
+    subplot.set_ylim(bottom=-0.05, top=1.05)
+    subplot.grid(visible=True, which="major")
+    subplot.grid(visible=True, which="minor")
+    subplot.spines["top"].set_visible(False)
+    subplot.spines["right"].set_visible(False)
+    subplot.set_xlabel("Magnitude")
+    subplot.set_ylabel("Recall (ratio of detected over total stars)")
+    figure.savefig(f'{results_filename}/9_recall_curve.png')
+    # Close the figure
+    plt.close(figure)
+
+def format_results(sources_calibrated, source_positions, field_solved):
+
+    if field_solved:
+        # get the most important values and save to disk
+        # put in float to ensure it can be dumped as json later
+        matching_errors = [float(source['match_error_pix']) for source in sources_calibrated['sources_astro']]
+        matching_errors_arcsec = [float(source['match_error_arcsec']) for source in sources_calibrated['sources_astro']]
+        event_counts = [float(source['event_count']) for source in sources_calibrated['sources_pix']]
+        event_rates = [float(source['event_rate']) for source in sources_calibrated['sources_pix']]
+        mags = [float(source['mag']) for source in sources_calibrated['sources_astro']]
+        areas = [float(source['equivalent_diameter_area']) for source in sources_calibrated['sources_pix']]
+        areas_arcsec = [float(area * sources_calibrated['pixel_scale_arcsec']) for area in areas]
+        matched_in_fov = [source['match_in_fov'] for source in sources_calibrated['sources_astro']]
+        print(f'second occurrence min mag: {numpy.min(mags)}')
+
+        #one produced for each dataset
+        output_results = {
+            'matching_errors': matching_errors,
+            'mean_matching_errors': numpy.mean(matching_errors),
+            'std_matching_errors':numpy.std(matching_errors),
+            'median_matching_errors':numpy.median(matching_errors),
+            'matching_errors_arcsec': matching_errors_arcsec,
+            'mean_matching_errors_arcsec': numpy.mean(matching_errors_arcsec),
+            'std_matching_errors_arcsec':numpy.std(matching_errors_arcsec),
+            'median_matching_errors_arcsec':numpy.median(matching_errors_arcsec),
+            'event_counts': event_counts,
+            'event_rates': event_rates,
+            'mags': mags,
+            'areas': areas,
+            'areas_arcsec': areas_arcsec, 
+            'astrometric_solution': True, 
+            'detected_sources': len(source_positions),
+            'matched_sources': len(mags),
+            'matched_sources_within_fov':matched_in_fov
+        }
+    else:
+        output_results = {
+                           'astrometric_solution':False, 
+                           'detected_sources': len(source_positions),
+                           'matched_sources':0
+                           }
+    return output_results
 
 def astrometric_calibration(source_pix_positions, centre_ra, centre_dec):
 
@@ -3590,6 +4176,86 @@ def rgb_render_advanced(cumulative_map_object, l_values):
     image = Image.fromarray(rgb_image)
     return image.transpose(Image.FLIP_TOP_BOTTOM)
 
+
+def save_events_to_es(events, filename, ordering):
+    import loris
+    events_array = numpy.zeros((len(events), 4))
+    events_array[:, 0] = events['t']
+    events_array[:, 1] = events['x']
+    events_array[:, 2] = events['y']
+    events_array[:, 3] = events['on'].astype(int)
+    final_array = numpy.asarray(events_array)
+    loris.write_events_to_file(final_array, filename, ordering)
+    print("File: " + filename + " converted to .es")
+
+def save_events_to_txt(events, txt_path, chunk_size):
+    with open(txt_path, 'w') as f:
+        for idx in tqdm(range(0, len(events), chunk_size)):
+            for j in range(idx, min(idx + chunk_size, len(events))):
+                # Format each event with a single space between elements
+                event_str = f"{numpy.float64((events['t'][j] - events['t'][0])/1e6):.6f} {int(events['x'][j])} {int(events['y'][j])} {int(events['on'][j])}\n"
+                f.write(event_str)
+    print(f"{txt_path} file's saved")
+
+
+def rgb_render_white(cumulative_map_object, l_values):
+    """Render the cumulative map using RGB values based on the frequency of each class, with a white background and save as PNG."""
+    
+    def generate_intense_palette(n_colors):
+        """Generate an array of intense and bright RGB colors, avoiding blue."""
+        base_palette = numpy.array([
+            [255, 255, 255],  # White (will invert to black)
+            [0, 255, 255],    # Cyan (will invert to red)
+            [255, 0, 255],    # Magenta (will invert to green)
+            [255, 255, 0],    # Yellow (will invert to blue)
+            [0, 255, 0],      # Green (will invert to magenta)
+            [255, 0, 0],      # Red (will invert to cyan)
+            [0, 128, 128],    # Teal (will invert to a light orange)
+            [128, 0, 128],    # Purple (will invert to a light green)
+            [255, 165, 0],    # Orange (will invert to a blue-green)
+            [128, 128, 0],    # Olive (will invert to a light blue)
+            [255, 192, 203],  # Pink (will invert to a light green-blue)
+            [165, 42, 42],    # Brown (will invert to a light blue-green)
+            [0, 100, 0],      # Dark Green (will invert to a light magenta)
+            [173, 216, 230],  # Light Blue (will invert to a darker yellow)
+            [245, 222, 179],  # Wheat (will invert to a darker blue)
+            [255, 20, 147],   # Deep Pink (will invert to a light cyan-green)
+            [75, 0, 130],     # Indigo (will invert to a lighter yellow)
+            [240, 230, 140],  # Khaki (will invert to a light blue)
+            [0, 0, 128],      # Navy (will invert to a light yellow)
+        ], dtype=numpy.uint8)
+        palette = numpy.tile(base_palette, (int(numpy.ceil(n_colors / base_palette.shape[0])), 1))
+        return palette[:n_colors]
+
+
+    cumulative_map = cumulative_map_object.pixels
+    height, width = cumulative_map.shape
+    rgb_image = numpy.ones((height, width, 3), dtype=numpy.uint8) * 255  # Start with a white background
+
+    unique, counts = numpy.unique(l_values[l_values != 0], return_counts=True)
+    sorted_indices = numpy.argsort(counts)[::-1]
+    sorted_unique = unique[sorted_indices]
+    sorted_unique = numpy.concatenate(([0], sorted_unique))
+
+    palette = generate_intense_palette(len(sorted_unique))
+    color_map = dict(zip(sorted_unique, palette))
+    
+    for label, color in color_map.items():
+        mask = l_values == label
+        if numpy.any(mask):
+            norm_intensity = cumulative_map[mask] / (cumulative_map[mask].max() + 1e-9)
+
+            norm_intensity = numpy.power(norm_intensity, 0.01)
+            blended_color = color * norm_intensity[:, numpy.newaxis]
+            rgb_image[mask] = numpy.clip(blended_color, 0, 255)
+    
+    image = Image.fromarray(rgb_image, 'RGB')
+    inverted_image = ImageOps.invert(image)
+    inverted_image = inverted_image.transpose(Image.FLIP_TOP_BOTTOM)
+    return inverted_image
+
+
+
 def rgb_render(cumulative_map_object, l_values):
     """Render the cumulative map using HSV values based on the frequency of each class."""
     def generate_palette_hsv(n_colors):
@@ -4013,7 +4679,7 @@ def dvs_sparse_filter_alex_conv(events):
     shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
     max_shifted = numpy.maximum.reduce(shifted)
     ratios = event_count / (max_shifted + 1.0)
-    smart_mask = ratios < 3.0
+    smart_mask = ratios < 2.0
 
     yhot, xhot = numpy.where(~smart_mask)
     label_hotpix = numpy.zeros(len(events), dtype=bool)
