@@ -178,6 +178,18 @@ class CumulativeMap:
     pixels: numpy.ndarray
 
 
+def remove_hot_pixels_percentile(events: numpy.ndarray, ratio: float):
+    assert 0.0 <= ratio <= 1.0
+    count = numpy.zeros((events["x"].max() + 1, events["y"].max() + 1), dtype="<u8")
+    numpy.add.at(count, (events["x"], events["y"]), 1)  # type: ignore
+    threshold = numpy.percentile(count, 100.0 * (1.0 - ratio))
+    mask = count[events["x"], events["y"]] > threshold
+    labels = numpy.zeros(len(events["x"]), dtype=int)
+    labels[mask] = 1
+    filtered_events = events[~mask]
+    return labels
+
+
 def without_most_active_pixels(events: numpy.ndarray, ratio: float):
     assert ratio >= 0.0 and ratio <= 1.0
     count = numpy.zeros((events["x"].max() + 1, events["y"].max() + 1), dtype="<u8")
@@ -651,14 +663,18 @@ class KhodamoradiNoiseFilter:
         support = self.search_correlation(event)
         
         # if support > 2:
-        #     self.intenrenr +=1
+        #     self.intenrenr += 1
         #     print(support)
         # print(self.intenrenr)
 
         is_signal = (support >= self.mIntThreshold)
+        target_dtype = numpy.dtype([('t', '<u8'), ('x', '<u2'), ('y', '<u2'), ('on', '?')])
+        new_event = numpy.zeros(1, dtype=target_dtype)
+        for field in target_dtype.names:
+            new_event[field] = event[field]
 
-        self.xCols[event['x']] = event
-        self.yRows[event['y']] = event
+        self.xCols[event['x']] = new_event[0]
+        self.yRows[event['y']] = new_event[0]
 
         return is_signal
 
@@ -798,11 +814,15 @@ class TimeSurfaceFilter:
     def evaluate(self, event):
         surface = self.fit_time_surface(event)
         is_signal = surface >= self.mFloatThreshold
+        target_dtype = numpy.dtype([('t', '<u8'), ('x', '<u2'), ('y', '<u2'), ('on', '?')])
+        new_event = numpy.zeros(1, dtype=target_dtype)
+        for field in target_dtype.names:
+            new_event[field] = event[field]
 
         if event['on']:
-            self.mPos[event['x'], event['y']] = event
+            self.mPos[event['x'], event['y']] = new_event[0]
         else:
-            self.mNeg[event['x'], event['y']] = event
+            self.mNeg[event['x'], event['y']] = new_event[0]
 
         return is_signal
 
@@ -921,7 +941,7 @@ DEFAULT_TIMESTAMP = -1
 class SpatioTemporalCorrelationFilter:
     def __init__(self, size_x, size_y, subsample_by=1):
         self.num_must_be_correlated = 2  # k (constant)
-        self.shot_noise_correlation_time_s = 0.01  # tau (variable for ROC)
+        self.shot_noise_correlation_time_s = 0.1  # tau (variable for ROC)
         self.filter_alternative_polarity_shot_noise_enabled = False
         self.subsample_by = subsample_by
         self.size_x = size_x
@@ -943,7 +963,7 @@ class SpatioTemporalCorrelationFilter:
         self.reset_shot_noise_test_stats()
 
     def filter_packet(self, events):
-        boolean_mask = numpy.zeros(len(events), dtype=bool)
+        boolean_mask = numpy.ones(len(events), dtype=bool)
         dt = int(round(self.shot_noise_correlation_time_s * 1e6))
         filtered_events = []
         for i, event in enumerate(events):
@@ -951,18 +971,18 @@ class SpatioTemporalCorrelationFilter:
             x >>= self.subsample_by
             y >>= self.subsample_by
             if not (0 <= x <= self.ssx and 0 <= y <= self.ssy):
-                boolean_mask[i] = True
+                boolean_mask[i] = False #True
                 continue
             if self.timestamp_image[x, y] == DEFAULT_TIMESTAMP:
                 self.store_timestamp_polarity(x, y, ts, on)
-                boolean_mask[i] = True
+                boolean_mask[i] = False #True
                 continue
             ncorrelated = self.count_correlated_events(x, y, ts, dt)
             if ncorrelated < self.num_must_be_correlated:
-                boolean_mask[i] = True
+                boolean_mask[i] = False #True
                 continue
             if self.filter_alternative_polarity_shot_noise_enabled and self.test_filter_out_shot_noise_opposite_polarity(x, y, ts, on):
-                boolean_mask[i] = True
+                boolean_mask[i] = False #True
                 continue
             filtered_events.append(event)
             self.store_timestamp_polarity(x, y, ts, on)
@@ -1009,26 +1029,20 @@ def plot_roc_curve(fpr,tpr):
     plt.show()
 
 
-def roc_val(detected_noise, ground_truth):
+def roc_val(input_events, detected_noise, ground_truth):
     """
     Calculate the true positive (TP), true negative (TN), false positive (FP), and false negative (FN) rates.
 
     Parameters:
-    label_hotpix_binary (numpy.array or list): Binary array or list where:
-        - 0 indicates not detected noise event (considered as signal)
-        - 1 indicates detected noise event
+    detected_noise (numpy.array or list): Binary array or list where:
+        - 0 indicates noise
+        - 1 indicates signal
     ground_truth (numpy.array or list): Binary array or list where:
-        - 0 indicates non-signal event (considered as noise)
-        - 1 indicates signal event
+        - 0 indicates noise
+        - 1 indicates signal
 
     Returns:
     tuple: Normalized values of TP, TN, FP, and FN in the form (TP, TN, FP, FN)
-
-    Definitions:
-    - True Positive (TP): Signal event correctly labeled as signal (detected_noise == 0 and ground_truth == 1)
-    - True Negative (TN): Noise event correctly labeled as noise (detected_noise == 1 and ground_truth == 0)
-    - False Positive (FP): Noise event incorrectly labeled as signal (detected_noise == 0 and ground_truth == 0)
-    - False Negative (FN): Signal event incorrectly labeled as noise (detected_noise == 1 and ground_truth == 1)
     """
     detected_noise  = numpy.array(detected_noise)
     ground_truth    = numpy.array(ground_truth)
@@ -1048,21 +1062,43 @@ def roc_val(detected_noise, ground_truth):
     normalized_FP = FP / total
     normalized_FN = FN / total
     
-    # Compute precision, recall, and F1-score
-    precision   = precision_score(ground_truth, 1 - detected_noise, pos_label=0)  # Set pos_label to 0 for noise
-    recall      = recall_score(ground_truth, 1 - detected_noise, pos_label=0)
-    f1          = f1_score(ground_truth, 1 - detected_noise, pos_label=0)
     
-    print(f'TP: {TP} ({normalized_TP:.3f}), TN: {TN} ({normalized_TN:.3f}), FP: {FP} ({normalized_FP:.3f}), FN: {FN} ({normalized_FN:.3f})')
-    print(f'Precision: {precision:.3f}, Recall: {recall:.3f}, F1-score: {f1:.3f}')
+    HP_idx    = numpy.where(numpy.logical_or(ground_truth==2,ground_truth==1)) #only hot pixels
+    HP_no_idx = numpy.where(numpy.logical_or(ground_truth==0,ground_truth==1))[0] #only noise
+    
+    # Compute precision, recall, and F1-score
+    groundtruth_noise = ground_truth[HP_no_idx]
+    actually_detected_noise = detected_noise[HP_no_idx]
+    precision_noise   = 100*(precision_score(groundtruth_noise, actually_detected_noise, pos_label=1))
+    recall_noise      = 100*(recall_score(groundtruth_noise, actually_detected_noise, pos_label=1))
+    f1_noise          = 100*(f1_score(groundtruth_noise, actually_detected_noise, pos_label=1))
+    
+    hot_pixel_gt = ground_truth[HP_idx]
+    hot_pixel_gt[hot_pixel_gt==2] = 0
+    detected_hot_pixels = detected_noise[HP_idx]
+    precision_hp   = 100*(precision_score(hot_pixel_gt, detected_hot_pixels, pos_label=1))
+    recall_hp      = 100*(recall_score(hot_pixel_gt, detected_hot_pixels, pos_label=1))
+    f1_hp          = 100*(f1_score(hot_pixel_gt, detected_hot_pixels, pos_label=1))
+    
+    signal_intersection = numpy.where(numpy.logical_and(detected_noise == 1,ground_truth == 1))
+    noise_intersection  = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 0))
+    hot_pixel_intersection  = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 2))
 
-    return TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1
+    SR = 100*(len(signal_intersection[0])/len(numpy.where(ground_truth == 1)[0]))
+    NR = 100*(len(noise_intersection[0])/len(numpy.where(ground_truth == 0)[0]))
+    HPR = 100*(len(hot_pixel_intersection[0])/len(numpy.where(ground_truth == 2)[0]))
+    DA = (SR+NR)/2
+    HDA = (SR+NR+HPR)/3
+    
+    print(f"SR: {SR:.2f}% NR: {NR:.2f}% HPR: {HPR:.3f}% DA: {DA:.2f}% HDA: {HDA:.3f}%")
+
+    return precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA
 
 
 
 def CrossConv(input_events, ground_truth, time_window):
     print("Start processing CrossConv filter...")
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
 
     x = input_events['x']
@@ -1100,17 +1136,48 @@ def CrossConv(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {numpy.sum(label_hotpix)}')
 
     detected_noise  = label_hotpix_binary
+    detected_noise  = 1 - detected_noise
     ground_truth    = ground_truth[ii]
+    
+    ###################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # jj = numpy.where(detected_noise==0)[0]
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[jj],
+    #                                                       detected_noise[jj].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[jj],vy_velocity_raw[jj]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # zz = numpy.where(detected_noise==1)[0]
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[zz],
+    #                                                         detected_noise[zz].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[zz],vy_velocity_raw[zz]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ##################################################################################
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score  = roc_val(detected_noise, ground_truth)
-    performance     = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA  = roc_val(input_events, detected_noise, ground_truth)
+    performance     = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
 
-    return output_events, performance
+    return output_events, performance, detected_noise
 
 def STCF(input_events, ground_truth, time_window):
     print("Start processing STCF filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1123,17 +1190,46 @@ def STCF(input_events, ground_truth, time_window):
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
     detected_noise = boolean_mask.astype(int)
+    
+    ###################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ###################################################################################
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 
 def DFWF(input_events, ground_truth, time_window):
     print("Start processing DWF/FWF filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1146,16 +1242,46 @@ def DFWF(input_events, ground_truth, time_window):
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
     detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
+    ###################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ##################################################################################
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 def TS(input_events, ground_truth, time_window):
     print("Start processing TS filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1169,17 +1295,47 @@ def TS(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+    ###################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ##################################################################################
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 
 def YNoise(input_events, ground_truth, time_window):
     print("Start processing YNoise filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1188,23 +1344,53 @@ def YNoise(input_events, ground_truth, time_window):
     print(f'Number of input event: {len(input_events["x"])}')
 
     yang_noise_filter             = YangNoiseFilter(resolution=(x_max, y_max))
-    boolean_mask, output_events = yang_noise_filter << input_events
+    boolean_mask, output_events   = yang_noise_filter << input_events
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+    ##################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    #################################################################################
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 
 
 def KNoise(input_events, ground_truth, time_window):
     print("Start processing KNoise filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1218,17 +1404,47 @@ def KNoise(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+    ##################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    #################################################################################
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 
 def EvFlow(input_events, ground_truth, time_window):
     print("Start processing EvFlow filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1242,17 +1458,47 @@ def EvFlow(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
+    ##################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ################################################################################
 
-    return output_events, performance
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
 
 
 def IETS(input_events, ground_truth, time_window):
     print("Start processing IETS filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     # ii = numpy.where(numpy.logical_and(input_events["t"] > 0, input_events["t"] < time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
@@ -1261,34 +1507,52 @@ def IETS(input_events, ground_truth, time_window):
 
     print(f'Number of input event: {len(input_events["x"])}')
 
-    multiTriggerWindow = 2e6
+    multiTriggerWindow = 1e6
     inceptive_filter = InceptiveFilter(multiTriggerWindow)
     detected_noise = inceptive_filter.filter(input_events)
 
     output_events = input_events[~detected_noise]
+    detected_noise = detected_noise.astype(int)
+    detected_noise = 1 - detected_noise
 
-    # warped_image = accumulate((1280,720), input_events, (0, 0))
-    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    # rendered_image.show()  
+    ##################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ################################################################################
 
-    # warped_image = accumulate((1280,720), output_events, (0, 0))
-    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    # rendered_image.show()  
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
 
-    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
-
-    # detected_noise = boolean_mask.astype(int)
-
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
-
-    return output_events, performance
+    return output_events, performance, detected_noise
 
 
 def STDF(input_events, ground_truth, time_window):
     print("Start processing STDF filter...")
 
-    ii = numpy.where(numpy.logical_and(input_events["t"] > time_window[0], input_events["t"] < time_window[1]))
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
     input_events = input_events[ii]
     ground_truth = ground_truth[ii]
 
@@ -1302,19 +1566,40 @@ def STDF(input_events, ground_truth, time_window):
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
 
     detected_noise = boolean_mask.astype(int)
+    detected_noise = 1 - detected_noise
+
+    #################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
     
-    # warped_image = accumulate((1280,720), input_events, (0, 0))
-    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    # rendered_image.show()  
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ###############################################################################
 
-    # warped_image = accumulate((1280,720), output_events, (0, 0))
-    # rendered_image = render(warped_image, colormap_name="magma", gamma=lambda image: image ** (1 / 3))
-    # rendered_image.show()  
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
 
-    TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score = roc_val(detected_noise, ground_truth)
-    performance = [TP, TN, FP, FN, normalized_TP, normalized_TN, normalized_FP, normalized_FN, precision, recall, f1_score]
-
-    return output_events, performance
+    return output_events, performance, detected_noise
 
 
 
@@ -1327,14 +1612,14 @@ def filter_events(input_events, ground_truth, time_window, method="STCF", save_p
     
     # Execute the method function
     start_time = time.time()
-    output_events, performance = method_function(input_events, ground_truth, time_window)
+    output_events, performance, detected_noise = method_function(input_events, ground_truth, time_window)
     end_time = time.time()
     
     # Save performance metrics if requested
     if save_performance:
         performance += f" | Execution time: {end_time - start_time} seconds"
     
-    return output_events, performance if save_performance else output_events
+    return output_events, performance, detected_noise if save_performance else output_events
 
 ###########################################################################
 
