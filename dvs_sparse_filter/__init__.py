@@ -575,14 +575,14 @@ class EventFlowFilter:
         flow = self.fit_event_flow(event)
 
         # Evaluate
-        is_signal = (flow <= self.mFloatThreshold)
+        is_stars = (flow <= self.mFloatThreshold)
 
         # Update deque
         while self.mDeque and (int(event['t']) - int(self.mDeque[0]['t']) >= self.mDuration):
             self.mDeque.popleft()
         self.mDeque.append(event)
 
-        return is_signal
+        return is_stars
 
     def retain(self, event):
         return self.evaluate(event)
@@ -667,7 +667,7 @@ class KhodamoradiNoiseFilter:
         #     print(support)
         # print(self.intenrenr)
 
-        is_signal = (support >= self.mIntThreshold)
+        is_stars = (support >= self.mIntThreshold)
         target_dtype = numpy.dtype([('t', '<u8'), ('x', '<u2'), ('y', '<u2'), ('on', '?')])
         new_event = numpy.zeros(1, dtype=target_dtype)
         for field in target_dtype.names:
@@ -676,7 +676,7 @@ class KhodamoradiNoiseFilter:
         self.xCols[event['x']] = new_event[0]
         self.yRows[event['y']] = new_event[0]
 
-        return is_signal
+        return is_stars
 
     def retain(self, event):
         return self.evaluate(event)
@@ -740,12 +740,12 @@ class YangNoiseFilter:
 
     def evaluate(self, event):
         density = self.calculate_density(event)
-        is_signal = density >= self.mIntThreshold
+        is_stars = density >= self.mIntThreshold
 
         self.mTimestampMat[event['x'], event['y']] = event['t']
         self.mPolarityMat[event['x'], event['y']] = event['on']
 
-        return is_signal
+        return is_stars
 
     def retain(self, event):
         return self.evaluate(event)
@@ -813,7 +813,7 @@ class TimeSurfaceFilter:
 
     def evaluate(self, event):
         surface = self.fit_time_surface(event)
-        is_signal = surface >= self.mFloatThreshold
+        is_stars = surface >= self.mFloatThreshold
         target_dtype = numpy.dtype([('t', '<u8'), ('x', '<u2'), ('y', '<u2'), ('on', '?')])
         new_event = numpy.zeros(1, dtype=target_dtype)
         for field in target_dtype.names:
@@ -824,7 +824,7 @@ class TimeSurfaceFilter:
         else:
             self.mNeg[event['x'], event['y']] = new_event[0]
 
-        return is_signal
+        return is_stars
 
     def retain(self, event):
         return self.evaluate(event)
@@ -1094,7 +1094,45 @@ def roc_val(input_events, detected_noise, ground_truth):
 
     return precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA
 
+def CrossConv_HotPixelFilter(input_events):
+    print("Start removing hot pixels...")
 
+    x = input_events['x']
+    y = input_events['y']
+    x_max, y_max = x.max() + 1, y.max() + 1
+
+    # Create a 2D histogram of event counts
+    event_count = numpy.zeros((x_max, y_max), dtype=int)
+    numpy.add.at(event_count, (x, y), 1)
+
+    kernels = [
+        numpy.array([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        numpy.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    ]
+
+    # Apply convolution with each kernel and calculate ratios
+    shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
+    max_shifted = numpy.maximum.reduce(shifted)
+    ratios = event_count / (max_shifted + 1.0)
+    smart_mask = ratios < 2.0 #this should be 2 ideally
+
+    yhot, xhot      = numpy.where(~smart_mask)
+    label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
+    for xi, yi in zip(xhot, yhot):
+        label_hotpix |= (y == xi) & (x == yi)
+    label_hotpix_binary = label_hotpix.astype(int)
+
+    jj              = numpy.where(label_hotpix_binary==0)[0]
+    output_events   = input_events[jj]
+    
+    print(f'Number of input event: {len(input_events["x"])}')
+    print(f'Number of hot pixel events: {numpy.sum(label_hotpix)}')
+    
+    hot_pixel_labels  = label_hotpix_binary
+    # hot_pixel_labels  = 1 - detected_noise
+    return output_events, hot_pixel_labels
 
 def CrossConv(input_events, ground_truth, time_window):
     print("Start processing CrossConv filter...")
@@ -1766,40 +1804,33 @@ def viz_LiC_ELM(dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, Yt
     }
 
     noise_LiC = numpy.where(events["yPredLiC"] == 1)[0]
-    events_indexed_signal_LiC = {key: value[noise_LiC] for key, value in events.items()}
+    events_indexed_stars_LiC = {key: value[noise_LiC] for key, value in events.items()}
 
     signal_ELM = numpy.where(events["yPredELM"] == 1)[0]
-    events_indexed_signal_ELM = {key: value[signal_ELM] for key, value in events.items()}
+    events_indexed_stars_ELM = {key: value[signal_ELM] for key, value in events.items()}
 
     numpy.savez(f"./output/benchmark/{dataname}/processed_events", **events)
 
-    ''' This how the data 
-    loaded = np.load(f"./output/benchmark/{dataname}/processed_events.npz")
-    events_loaded = {key: loaded[key] for key in loaded.files}
-    for key in events_loaded:
-        print(f"{key}: {events_loaded[key].shape}")
-    '''
-
     cumulative_map_object  = accumulate((1280,720),events,(0,0))
     warped_image_segmentation   = render(cumulative_map_object, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation.save(f"./output/benchmark/{dataname}/all_events_image.png")
+    warped_image_segmentation.save(f"./output/benchmark/{dataname}/{dataname}_all_events_image.png")
 
-    cumulative_map_LiC  = accumulate((1280,720),events_indexed_signal_LiC,(0,0))
+    cumulative_map_LiC  = accumulate((1280,720),events_indexed_stars_LiC,(0,0))
     warped_image_segmentation_LiC   = render(cumulative_map_LiC, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/filtered_events_LiC_signal.png")
+    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/{dataname}_filtered_events_LiC_stars.png")
 
-    cumulative_map_object_ELM  = accumulate((1280,720),events_indexed_signal_ELM,(0,0))
+    cumulative_map_object_ELM  = accumulate((1280,720),events_indexed_stars_ELM,(0,0))
     warped_image_segmentation_ELM   = render(cumulative_map_object_ELM, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/filtered_events_ELM_signal.png")
+    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/{dataname}_filtered_events_ELM_stars.png")
 
     
     cumulative_map_LiC, seg_label_LiC   = accumulate_cnt_rgb((1280, 720), events, events["yPredLiC"], (events["vx_zero"], events["vy_zero"]))
     warped_image_segmentation_LiC       = rgb_render_advanced(cumulative_map_LiC, seg_label_LiC)
-    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/yPredLiC_labelled_image.png")
+    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/{dataname}_yPredLiC_labelled_image.png")
 
     cumulative_map_ELM, seg_label_ELM   = accumulate_cnt_rgb((1280, 720), events, events["yPredELM"], (events["vx_zero"], events["vy_zero"]))
     warped_image_segmentation_ELM       = rgb_render_advanced(cumulative_map_ELM, seg_label_ELM)
-    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/yPredELM_labelled_image.png")
+    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/{dataname}_yPredELM_labelled_image.png")
 
     fprLiC, tprLiC, _ = roc_curve(Ytest[:,0], YtestOutputProbLiC[:,0], pos_label=1)
     fprELM, tprELM, _ = roc_curve(Ytest[:,0], YtestOutputProbELM[:,0], pos_label=1)
@@ -1817,17 +1848,226 @@ def viz_LiC_ELM(dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, Yt
     plt.savefig(f"./output/benchmark/{dataname}/roc_curve_LiC_ELM.png")
 
 
+def FEAST_training(parent_folder):
+    epoch               = 10
+    nNeuron_noise       = 200
+    nNeuron_stars       = int(numpy.round((nNeuron_noise/2)))
+    nNeuron_satellites  = int(numpy.round((nNeuron_noise/2)))
+    thresholdRise       = 0.001
+    thresholdFall       = 0.002
+    tau                 = 1e6
+    eta_noise           = 0.0005
+    eta_stars           = 0.0001
+    eta_satellites      = 0.01
+    R                   = 5
+    D                   = 2 * R + 1
+
+    w_satellites = numpy.random.rand(D * D, nNeuron_satellites)
+    for iNeuron in range(nNeuron_satellites):
+        w_satellites[:, iNeuron] /= numpy.linalg.norm(w_satellites[:, iNeuron])
+        
+    w_stars = numpy.random.rand(D * D, nNeuron_stars)
+    for iNeuron in range(nNeuron_stars):
+        w_stars[:, iNeuron] /= numpy.linalg.norm(w_stars[:, iNeuron])
+        
+    w_noise = numpy.random.rand(D * D, nNeuron_noise)
+    for iNeuron in range(nNeuron_noise):
+        w_noise[:, iNeuron] /= numpy.linalg.norm(w_noise[:, iNeuron])
+        
+    recording_folders = [f for f in os.listdir(parent_folder) if os.path.isdir(os.path.join(parent_folder, f))]
+
+    training_folders  = recording_folders[:60]
+
+    # # Combine training and testing folders, marking their type
+    # combined_folders = [(f, "TrainingStars") for f in training_folders]
+    
+    for iteration in range(epoch):
+        print_message(f'Epoch: {iteration}', color='yellow', style='bold')
+
+        # Shuffle the order of the first 60 directories
+        random.shuffle(training_folders)
+        
+        # Combine training folders with their type
+        combined_folders = [(f, "TrainingStars") for f in training_folders]
+
+        # Processing all folders
+        f_idx = 0
+        for recording_name, validation_type in combined_folders:
+            print(f"{validation_type}  Processing file: {recording_name}")
+            folder_path = os.path.join(parent_folder, recording_name)
+            
+            # Find the .es file in the folder
+            es_file_path = None
+            for file_name in os.listdir(folder_path):
+                if file_name.endswith(".es"):
+                    es_file_path = os.path.join(folder_path, file_name)
+                    break
+            
+            width, height, events = read_es_file(es_file_path)
+            sensor_size = (width, height)        
+            
+            if os.path.exists(f"{parent_folder}/{recording_name}/labelled_events_v2.0.0.npy"):
+                labels = numpy.load(f"{parent_folder}/{recording_name}/labelled_events_v2.0.0.npy")
+            else:
+                labels = numpy.load(f"{parent_folder}/{recording_name}/labelled_events_v2.5.0.npy")
+            
+            events_labels = numpy.zeros(len(events["x"]), dtype=int)
+
+            label_dict = {}
+            for row in labels:
+                coord = (row['x'], row['y'])
+                if row['label'] != 0:  # Exclude noise labels
+                    label_dict[coord] = row['label']
+
+            # Assign labels to events based on pixel coordinates
+            for i, event in enumerate(events):
+                coord = (event['x'], event['y'])
+                if coord in label_dict:
+                    events_labels[i] = label_dict[coord]
+
+            # Create a structured array with the new labels column
+            events_with_labels = numpy.zeros(len(events), dtype=[('t', '<u8'),
+                                                            ('x', '<u2'),
+                                                            ('y', '<u2'),
+                                                            ('on', '?'),
+                                                            ('label', '<i2')])
+            events_with_labels['t']     = events['t']
+            events_with_labels['x']     = events['x']
+            events_with_labels['y']     = events['y']
+            events_with_labels['on']    = events['on']
+            events_with_labels['label'] = events_labels
+
+            nnn = numpy.where(numpy.logical_and(events_with_labels['t'] > 10e6, events_with_labels['t'] < events_with_labels['t'][-1]))
+            events = events_with_labels[nnn]
+            events["label"][events["label"] > 0] = 1
+            events["label"][events["label"] < 0] = 2
+            events["t"] = events["t"] - events["t"][0]
+            
+            nTD = len(events['x'])
+            xs = numpy.max(events['x']) + 1
+            ys = numpy.max(events['y']) + 1
+        
+            # for epochIndex in range(epoch):
+            threshArray_stars = numpy.zeros(nNeuron_stars) + 0.001
+            threshArray_satellites = numpy.zeros(nNeuron_satellites) + 0.001
+            threshArray_noise = numpy.zeros(nNeuron_noise) + 0.001
+            T_stars = numpy.full((xs, ys), -numpy.inf)
+            P_stars = numpy.zeros((xs, ys))
+            T_satellites = numpy.full((xs, ys), -numpy.inf)
+            P_satellites = numpy.zeros((xs, ys))
+            T_noise = numpy.full((xs, ys), -numpy.inf)
+            P_noise = numpy.zeros((xs, ys))
+            
+            for idx in tqdm(range(nTD)):
+                x = int(events['x'][idx])
+                y = int(events['y'][idx])
+                p = int(events['on'][idx])
+                if p == 0:
+                    p = 1
+                t = int(events['t'][idx])
+                class_label = int(events['label'][idx])
+                
+                if class_label == 1: #stars
+                    T_stars[x, y] = t
+                    P_stars[x, y] = p
+
+                    if (x - R > 0) and (x + R < xs) and (y - R > 0) and (y + R < ys):
+                        ROI = P_stars[x - R:x + R + 1, y - R:y + R + 1] * numpy.exp((T_stars[x - R:x + R + 1, y - R:y + R + 1] - t) / tau)
+                        ROI_norm = ROI / numpy.linalg.norm(ROI)
+                        ROI_ARRAY = numpy.outer(ROI_norm.flatten(), numpy.ones(nNeuron_stars))
+                        dotProds = numpy.sum(w_stars * ROI_ARRAY, axis=0)
+                        C = dotProds * (dotProds > threshArray_stars)
+                        winnerNeuron = numpy.argmax(C)
+
+                        if numpy.all(C == 0):
+                            threshArray_stars -= thresholdFall
+                        else:
+                            w_stars[:, winnerNeuron] += eta_stars * ROI.flatten()
+                            w_stars[:, winnerNeuron] /= numpy.linalg.norm(w_stars[:, winnerNeuron])
+                            threshArray_stars[winnerNeuron] += thresholdRise
+
+                if class_label == 2: #satellites
+                    T_satellites[x, y] = t
+                    P_satellites[x, y] = p
+
+                    if (x - R > 0) and (x + R < xs) and (y - R > 0) and (y + R < ys):
+                        ROI = P_satellites[x - R:x + R + 1, y - R:y + R + 1] * numpy.exp((T_satellites[x - R:x + R + 1, y - R:y + R + 1] - t) / tau)
+                        ROI_norm = ROI / numpy.linalg.norm(ROI)
+                        ROI_ARRAY = numpy.outer(ROI_norm.flatten(), numpy.ones(nNeuron_satellites))
+                        dotProds = numpy.sum(w_satellites * ROI_ARRAY, axis=0)
+                        C = dotProds * (dotProds > threshArray_satellites)
+                        winnerNeuron = numpy.argmax(C)
+
+                        if numpy.all(C == 0):
+                            threshArray_satellites -= thresholdFall
+                        else:
+                            w_satellites[:, winnerNeuron] += eta_satellites * ROI.flatten()
+                            w_satellites[:, winnerNeuron] /= numpy.linalg.norm(w_satellites[:, winnerNeuron])
+                            threshArray_satellites[winnerNeuron] += thresholdRise
+                            
+                elif class_label == 0:
+                    T_noise[x, y] = t
+                    P_noise[x, y] = p
+
+                    if (x - R > 0) and (x + R < xs) and (y - R > 0) and (y + R < ys):
+                        ROI = P_noise[x - R:x + R + 1, y - R:y + R + 1] * numpy.exp((T_noise[x - R:x + R + 1, y - R:y + R + 1] - t) / tau)
+                        ROI_norm = ROI / numpy.linalg.norm(ROI)
+                        ROI_ARRAY = numpy.outer(ROI_norm.flatten(), numpy.ones(nNeuron_noise))
+                        dotProds = numpy.sum(w_noise * ROI_ARRAY, axis=0)
+                        C = dotProds * (dotProds > threshArray_noise)
+                        winnerNeuron = numpy.argmax(C)
+
+                        if numpy.all(C == 0):
+                            threshArray_noise -= thresholdFall
+                        else:
+                            w_noise[:, winnerNeuron] += eta_noise * ROI.flatten()
+                            w_noise[:, winnerNeuron] /= numpy.linalg.norm(w_noise[:, winnerNeuron])
+                            threshArray_noise[winnerNeuron] += thresholdRise
+            
+            w_signal = numpy.concatenate((w_satellites, w_stars), axis=1)
+            numpy.save("./output/feast/feast_weights.npy", w_signal, w_noise)
+            
+        # nNeuron = nNeuron_satellites + nNeuron_stars
+        # sqNeuron = int(numpy.ceil(numpy.sqrt(nNeuron)))
+        # fig, axes = plt.subplots(sqNeuron, sqNeuron, figsize=(15, 15))
+        # fig.suptitle('Weights signal', fontsize=16)
+
+        # for iNeuron in range(nNeuron):
+        #     ax = axes[iNeuron // sqNeuron, iNeuron % sqNeuron]
+        #     wShow = combined_weights[:, iNeuron].reshape(D, D)
+        #     # wShow[R, R] = numpy.nan  # Setting the center to NaN
+        #     cax = ax.imshow(wShow, cmap='hot')
+        #     ax.axis('off')
+        #     fig.colorbar(cax, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+        
+        # fig.savefig(f'./output/feast/feast_trained_weight_signal_epoch_{f_idx}.png')
+        
+        # fig2, axes2 = plt.subplots(sqNeuron, sqNeuron, figsize=(15, 15))
+        # fig2.suptitle('Weights noise', fontsize=16)
+
+        # for iNeuron in range(nNeuron_noise):
+        #     ax = axes2[iNeuron // sqNeuron, iNeuron % sqNeuron]
+        #     wShow = w_noise[:, iNeuron].reshape(D, D)
+        #     # wShow[R, R] = numpy.nan  # Setting the center to NaN
+        #     cax = ax.imshow(wShow, cmap='hot')
+        #     ax.axis('off')
+        #     fig2.colorbar(cax, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+
+        # fig2.savefig(f'./output/feast/feast_trained_weight_noise_epoch_{f_idx}.png')
+        # f_idx += 1
+        
+    return w_signal, w_noise
+
 def FEAST_inference(input_events, ground_truth, signalweight, noiseweight):
     downSampleFactor    = 5
     tau                 = 1e6
     beta                = 0.5
-    displayFreq         = 5e5
     R                   = 5
     D                   = 2 * R + 1
     pooling_wind        = 3
-    wFrozen             = numpy.hstack((signalweight['w'], noiseweight['w']))
-    neuron_labels       = numpy.hstack((numpy.ones(signalweight['w'].shape[1]), 
-                                        numpy.zeros(noiseweight['w'].shape[1]))).astype(int)
+    wFrozen             = numpy.hstack((signalweight, noiseweight))
+    neuron_labels       = numpy.hstack((numpy.ones(signalweight.shape[1]), 
+                                        numpy.zeros(noiseweight.shape[1]))).astype(int)
     nNeuron             = len(neuron_labels)
     nTD                 = len(input_events['x'])
 
