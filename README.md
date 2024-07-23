@@ -3,18 +3,20 @@
 <!-- <p align="center" width="100%">
     <img width="50%" src="fig/hot_pixel_package_logo2.png">
 </p> -->
-<!-- 
-# Objective
-
-A pixel-wise approach to remove any short and long lasting hot pixels from any event stream without knowing the true number of the hot pixels, using just a single parameter. -->
 
 Project page: https://samiarja.github.io/dvseventfilter/
 
+# Goal
+
+Below are the motivations and the goals of this work as well as the contributions:
+- A long term study of the change in noise and hot pixels
+
+
 # Installation
 
-```
-conda create --name hot_pixel_filter python=3.9
-conda activate hot_pixel_filter
+```sh
+conda create --name dvs_sparse_filter python=3.9
+conda activate dvs_sparse_filter
 python3 -m pip install -e .
 pip install torch
 pip install tqdm
@@ -30,8 +32,6 @@ pip install pillow
 python3 -m pip install astropy requests astrometry
 python3 -m pip install scikit-image matplotlib-label-lines ipywidgets
 conda install -c conda-forge pydensecrf
-
-sudo apt install -y build-essentials
 ```
 
 

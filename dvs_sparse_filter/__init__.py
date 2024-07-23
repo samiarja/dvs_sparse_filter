@@ -939,9 +939,9 @@ class DoubleFixedWindowFilter:
 
 DEFAULT_TIMESTAMP = -1
 class SpatioTemporalCorrelationFilter:
-    def __init__(self, size_x, size_y, subsample_by=1):
-        self.num_must_be_correlated = 2  # k (constant)
-        self.shot_noise_correlation_time_s = 0.1  # tau (variable for ROC)
+    def __init__(self, size_x, size_y, subsample_by=1, num_must_be_correlated=2, shot_noise_correlation_time_s=0.1):
+        self.num_must_be_correlated = num_must_be_correlated  # k (constant)
+        self.shot_noise_correlation_time_s = shot_noise_correlation_time_s  # tau (variable for ROC)
         self.filter_alternative_polarity_shot_noise_enabled = False
         self.subsample_by = subsample_by
         self.size_x = size_x
@@ -1017,16 +1017,17 @@ class SpatioTemporalCorrelationFilter:
         return True
 
 
-def plot_roc_curve(fpr,tpr):
-    # auc = roc_auc_score(y_true,y_score)
-    plt.xlabel('FPR')
-    plt.ylabel('TPR')
-    # plt.title('roc curve' + str(auc))
-    plt.plot(fpr,tpr,color='b',linewidth=1)
-    plt.plot([0,1],[0,1],'r--')
-    # plt.savefig(prefix + '_roccurve.pdf')
-    # plt.clf()
-    plt.show()
+def plot_roc_curve(fpr, tpr, filter_method, recording_name):
+    plt.figure()
+    plt.xlabel('False Positive Rate', fontsize=14)
+    plt.ylabel('True Positive Rate', fontsize=14)
+    plt.title('ROC Curve')
+    plt.plot(fpr, tpr, color='b', linewidth=1, marker='o', markersize=5)
+    plt.plot([0, 1], [0, 1], 'r--')
+    plt.xticks([i * 0.1 for i in range(11)])
+    plt.yticks([i * 0.1 for i in range(11)])
+    plt.savefig(f"/media/samiarja/VERBATIM HD/Denoising/{filter_method}/{recording_name}/{filter_method}_roc_curve.png")
+    # plt.show()
 
 
 def roc_val(input_events, detected_noise, ground_truth):
@@ -1080,8 +1081,8 @@ def roc_val(input_events, detected_noise, ground_truth):
     recall_hp      = 100*(recall_score(hot_pixel_gt, detected_hot_pixels, pos_label=1))
     f1_hp          = 100*(f1_score(hot_pixel_gt, detected_hot_pixels, pos_label=1))
     
-    signal_intersection = numpy.where(numpy.logical_and(detected_noise == 1,ground_truth == 1))
-    noise_intersection  = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 0))
+    signal_intersection     = numpy.where(numpy.logical_and(detected_noise == 1,ground_truth == 1))
+    noise_intersection      = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 0))
     hot_pixel_intersection  = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 2))
 
     SR = 100*(len(signal_intersection[0])/len(numpy.where(ground_truth == 1)[0]))
@@ -1094,7 +1095,7 @@ def roc_val(input_events, detected_noise, ground_truth):
 
     return precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA
 
-def CrossConv_HotPixelFilter(input_events):
+def CrossConv_HotPixelFilter(input_events,ratio_par):
     print("Start removing hot pixels...")
 
     x = input_events['x']
@@ -1116,7 +1117,7 @@ def CrossConv_HotPixelFilter(input_events):
     shifted = [convolve(event_count, k, mode="constant", cval=0.0) for k in kernels]
     max_shifted = numpy.maximum.reduce(shifted)
     ratios = event_count / (max_shifted + 1.0)
-    smart_mask = ratios < 2.0 #this should be 2 ideally
+    smart_mask = ratios < ratio_par #this should be 2 ideally
 
     yhot, xhot      = numpy.where(~smart_mask)
     label_hotpix    = numpy.zeros(len(input_events), dtype=bool)
@@ -1130,9 +1131,9 @@ def CrossConv_HotPixelFilter(input_events):
     print(f'Number of input event: {len(input_events["x"])}')
     print(f'Number of hot pixel events: {numpy.sum(label_hotpix)}')
     
-    hot_pixel_labels  = label_hotpix_binary
-    # hot_pixel_labels  = 1 - detected_noise
-    return output_events, hot_pixel_labels
+    detected_noise  = label_hotpix_binary
+    detected_noise  = 1 - detected_noise
+    return output_events, detected_noise
 
 def CrossConv(input_events, ground_truth, time_window):
     print("Start processing CrossConv filter...")
@@ -1223,7 +1224,7 @@ def STCF(input_events, ground_truth, time_window):
 
     print(f'Number of input event: {len(input_events["x"])}')
 
-    filter_instance             = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max)
+    filter_instance             = SpatioTemporalCorrelationFilter(size_x=x_max, size_y=y_max, num_must_be_correlated=2, shot_noise_correlation_time_s=0.1)
     boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
