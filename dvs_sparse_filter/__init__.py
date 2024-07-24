@@ -768,7 +768,7 @@ class YangNoiseFilter:
 
 
 class TimeSurfaceFilter:
-    def __init__(self, resolution, decay=100000, search_radius=1, float_threshold=0.2):
+    def __init__(self, resolution, decay, search_radius, float_threshold):
         self.mWidth = resolution[0]
         self.mHeight = resolution[1]
         self.mDecay = decay
@@ -844,7 +844,7 @@ class TimeSurfaceFilter:
 
 
 class DoubleFixedWindowFilter:
-    def __init__(self, sx, sy, wlen=175, disThr=100, useDoubleMode=False, numMustBeCorrelated=8):
+    def __init__(self, sx, sy, wlen, disThr, useDoubleMode, numMustBeCorrelated):
         self.sx = sx
         self.sy = sy
         self.wlen = wlen
@@ -1276,7 +1276,12 @@ def DFWF(input_events, ground_truth, time_window):
     
     print(f'Number of input event: {len(input_events["x"])}')
 
-    filter_instance             = DoubleFixedWindowFilter(sx=x_max, sy=y_max)
+    filter_instance             = DoubleFixedWindowFilter(sx=x_max, 
+                                                          sy=y_max,
+                                                          wlen=175, 
+                                                          disThr=100, 
+                                                          useDoubleMode=False, 
+                                                          numMustBeCorrelated=8)
     boolean_mask, output_events = filter_instance.filter_packet(input_events)
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
