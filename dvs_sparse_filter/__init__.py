@@ -1667,7 +1667,7 @@ def filter_events(input_events, ground_truth, time_window, method="STCF", save_p
 
 ###########################################################################
 
-def linearClassifier(Xtrain, Ytrain, Xtest,YtestGroundTruth):
+def linearClassifier(Xtrain, Ytrain, Xtest, YtestGroundTruth):
     YtestOutput = weightMapping(Xtrain, Ytrain, Xtest)
     accuracy, rmse, misclassified_count, YtestOutputMaxed = CalculateClassifierPerformance(Xtrain, Ytrain, Xtest, YtestGroundTruth, YtestOutput)
     return accuracy, YtestOutputMaxed, YtestOutput
@@ -1788,10 +1788,10 @@ def ELMWeight(Xtrain, Ytrain, Xtest, hiddenLayerSize, rescaleInputsToNonlinearRe
     return YtestOutput, hiddenLayerWeights, outputWeights
 
 
-def viz_LiC_ELM(dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, YtestOutputMaxedLiC,
-                YtestOutputMaxedELM, Ytest, YtestOutputProbLiC, YtestOutputProbELM):
-    if not os.path.exists(f"./output/benchmark/{dataname}"):
-        os.mkdir(f"./output/benchmark/{dataname}")
+def viz_LiC_ELM(sensor_size, output_dir, dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, YtestOutputMaxedLiC,
+                YtestOutputMaxedELM, Ytest, YtestOutputProbLiC, YtestOutputProbELM, Y_multi_labels_test, Y_predicted_test):
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
     
     sortIdx = numpy.argsort(tsCoordArraytest.flatten())
     events = {
@@ -1803,55 +1803,101 @@ def viz_LiC_ELM(dataname, xCoordArraytest, yCoordArraytest, tsCoordArraytest, Yt
         'yTest': Ytest[[sortIdx],0].flatten().astype(numpy.int32),
         'vx_zero': numpy.zeros_like(xCoordArraytest[[sortIdx]]).flatten(),
         'vy_zero': numpy.zeros_like(yCoordArraytest[[sortIdx]]).flatten(),
-        'yPredLiC_onehot': YtestOutputMaxedLiC,
-        'yPredELM_onehot': YtestOutputMaxedELM,
-        'yPredLiC_prob': YtestOutputProbLiC,
-        'yPredELM_prob': YtestOutputProbELM
+        'yPredLiC_onehot': YtestOutputMaxedLiC[sortIdx,:],
+        'yPredELM_onehot': YtestOutputMaxedELM[sortIdx,:],
+        'yPredLiC_prob': YtestOutputProbLiC[sortIdx,0],
+        'yPredELM_prob': YtestOutputProbELM[sortIdx,0],
+        'Y_multi_labels_test': Y_multi_labels_test[sortIdx].flatten().astype(numpy.int32),
+        'Y_predicted_test': Y_predicted_test[sortIdx].flatten().astype(numpy.int32),
     }
 
-    noise_LiC = numpy.where(events["yPredLiC"] == 1)[0]
-    events_indexed_stars_LiC = {key: value[noise_LiC] for key, value in events.items()}
+    signal_LiC = numpy.where(events["yPredLiC"] == 1)[0]
+    events_indexed_stars_LiC = {key: value[signal_LiC] for key, value in events.items()}
 
     signal_ELM = numpy.where(events["yPredELM"] == 1)[0]
     events_indexed_stars_ELM = {key: value[signal_ELM] for key, value in events.items()}
-
-    numpy.savez(f"./output/benchmark/{dataname}/processed_events", **events)
-
-    cumulative_map_object  = accumulate((1280,720),events,(0,0))
-    warped_image_segmentation   = render(cumulative_map_object, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation.save(f"./output/benchmark/{dataname}/{dataname}_all_events_image.png")
-
-    cumulative_map_LiC  = accumulate((1280,720),events_indexed_stars_LiC,(0,0))
-    warped_image_segmentation_LiC   = render(cumulative_map_LiC, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/{dataname}_filtered_events_LiC_stars.png")
-
-    cumulative_map_object_ELM  = accumulate((1280,720),events_indexed_stars_ELM,(0,0))
-    warped_image_segmentation_ELM   = render(cumulative_map_object_ELM, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
-    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/{dataname}_filtered_events_ELM_stars.png")
-
     
-    cumulative_map_LiC, seg_label_LiC   = accumulate_cnt_rgb((1280, 720), events, events["yPredLiC"], (events["vx_zero"], events["vy_zero"]))
-    warped_image_segmentation_LiC       = rgb_render_advanced(cumulative_map_LiC, seg_label_LiC)
-    warped_image_segmentation_LiC.save(f"./output/benchmark/{dataname}/{dataname}_yPredLiC_labelled_image.png")
+    signal_predicted = numpy.where(events["Y_predicted_test"] == 1)[0]
+    events_indexed_stars_predicted = {key: value[signal_predicted] for key, value in events.items()}
 
-    cumulative_map_ELM, seg_label_ELM   = accumulate_cnt_rgb((1280, 720), events, events["yPredELM"], (events["vx_zero"], events["vy_zero"]))
-    warped_image_segmentation_ELM       = rgb_render_advanced(cumulative_map_ELM, seg_label_ELM)
-    warped_image_segmentation_ELM.save(f"./output/benchmark/{dataname}/{dataname}_yPredELM_labelled_image.png")
+    numpy.savez(f"{output_dir}/{dataname}_processed_events", **events)
 
-    fprLiC, tprLiC, _ = roc_curve(Ytest[:,0], YtestOutputProbLiC[:,0], pos_label=1)
-    fprELM, tprELM, _ = roc_curve(Ytest[:,0], YtestOutputProbELM[:,0], pos_label=1)
-    aucLiC            = roc_auc_score(Ytest[:,0], YtestOutputProbLiC[:,0])
-    aucELM            = roc_auc_score(Ytest[:,0], YtestOutputProbELM[:,0])
+    # cumulative_map_object  = accumulate(sensor_size,events,(0,0))
+    # warped_image_segmentation   = render(cumulative_map_object, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    # warped_image_segmentation.save(f"{output_dir}/{dataname}_all_events_image.png")
+    
+    cumulative_map_ELM, seg_label_ELM   = accumulate_cnt_rgb(sensor_size, events, events["Y_multi_labels_test"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_ELM       = rgb_render_white(cumulative_map_ELM, seg_label_ELM)
+    warped_image_segmentation_ELM.save(f"{output_dir}/{dataname}_all_events_image_white.png")
 
+    cumulative_map_LiC  = accumulate(sensor_size,events_indexed_stars_LiC,(0,0))
+    warped_image_segmentation_LiC   = render(cumulative_map_LiC, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation_LiC.save(f"{output_dir}/{dataname}_filtered_events_LiC_stars.png")
+
+    cumulative_map_object_ELM  = accumulate(sensor_size,events_indexed_stars_ELM,(0,0))
+    warped_image_segmentation_ELM   = render(cumulative_map_object_ELM, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation_ELM.save(f"{output_dir}/{dataname}_filtered_events_ELM_stars.png")
+    
+    cumulative_map_object_predicted  = accumulate(sensor_size,events_indexed_stars_predicted,(0,0))
+    warped_image_segmentation_predicted   = render(cumulative_map_object_ELM, colormap_name="magma", gamma=lambda image: image ** (1 / 5))
+    warped_image_segmentation_predicted.save(f"{output_dir}/{dataname}_filtered_events_predicted_stars.png")
+
+    cumulative_map_LiC, seg_label_LiC   = accumulate_cnt_rgb(sensor_size, events, events["yPredLiC"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_LiC       = rgb_render_white(cumulative_map_LiC, seg_label_LiC)
+    warped_image_segmentation_LiC.save(f"{output_dir}/{dataname}_yPredLiC_labelled_image.png")
+
+    cumulative_map_ELM, seg_label_ELM   = accumulate_cnt_rgb(sensor_size, events, events["yPredELM"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_ELM       = rgb_render_white(cumulative_map_ELM, seg_label_ELM)
+    warped_image_segmentation_ELM.save(f"{output_dir}/{dataname}_yPredELM_labelled_image.png")
+    
+    cumulative_map_predicted, seg_label_predicted   = accumulate_cnt_rgb(sensor_size, events, events["Y_predicted_test"], (events["vx_zero"], events["vy_zero"]))
+    warped_image_segmentation_predicted       = rgb_render_white(cumulative_map_predicted, seg_label_predicted)
+    warped_image_segmentation_predicted.save(f"{output_dir}/{dataname}_Y_predicted_test_labelled_image.png")
+    
+    
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR_LiC, NR_LiC, HPR_LiC, DA_LiC, HDA_LiC  = roc_val(
+        events,
+        events["yPredLiC"],
+        events["Y_multi_labels_test"],
+    )
+    
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR_ELM, NR_ELM, HPR_ELM, DA_ELM, HDA_ELM  = roc_val(
+        events,
+        events["yPredELM"],
+        events["Y_multi_labels_test"],
+    )
+    
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR_Pred, NR_Pred, HPR_Pred, DA_Pred, HDA_Pred  = roc_val(
+        events,
+        events["Y_predicted_test"],
+        events["Y_multi_labels_test"],
+    )
+    
+    print_message(f"w/o classifier: SR: {SR_Pred:.3f} NR: {NR_Pred:.3f} HPR: {HPR_Pred:.3f} DA: {DA_Pred:.3f} HDA: {HDA_Pred}", color="yellow", style="bold")
+    print_message(f"w/ classifier: {SR_LiC:.3f} NR: {NR_LiC:.3f} HPR: {HPR_LiC:.3f} DA: {DA_LiC:.3f} HDA: {HDA_LiC}", color="yellow", style="bold")
+    # print_message(f"SR: {SR_ELM:.3f} NR: {NR_ELM:.3f} HPR: {HPR_ELM:.3f} DA: {DA_ELM:.3f} HDA: {HDA_ELM}", color="yellow", style="bold")
+
+    noise_satellite = numpy.where(numpy.logical_or(events["Y_multi_labels_test"]==0,events["Y_multi_labels_test"]==1))[0] #only noise
+    youtputLiC_indexed = YtestOutputProbLiC[sortIdx,0]
+    youtputELM_indexed = YtestOutputProbELM[sortIdx,0]
+    
+    fprLiC, tprLiC, _  = roc_curve(events["Y_multi_labels_test"][noise_satellite], youtputLiC_indexed[noise_satellite], pos_label=1)
+    fprELM, tprELM, _  = roc_curve(events["Y_multi_labels_test"][noise_satellite], youtputELM_indexed[noise_satellite], pos_label=1)
+    auc_LiC            = roc_auc_score(events["Y_multi_labels_test"][noise_satellite], youtputLiC_indexed[noise_satellite])
+    auc_ELM            = roc_auc_score(events["Y_multi_labels_test"][noise_satellite], youtputELM_indexed[noise_satellite])
+    
     plt.figure(figsize=(12, 6))
     plt.xlabel('FPR')
     plt.ylabel('TPR')
-    plt.title(f'roc LiC curve: {aucLiC:.3f}, roc ELM curve: {aucELM:.3f}')
+    plt.title(f'roc LiC curve: {auc_LiC:.3f}, roc ELM curve: {auc_ELM:.3f}')
     plt.plot(fprLiC, tprLiC, color='b', linewidth=1)
     plt.plot(fprELM, tprELM, color='g', linewidth=1)
     plt.plot([0, 1], [0, 1], 'r--')
     plt.legend(["LiC","ELM"])
-    plt.savefig(f"./output/benchmark/{dataname}/roc_curve_LiC_ELM.png")
+    plt.savefig(f"{output_dir}/{dataname}_roc_curve_LiC_ELM.png")
+    plt.close()
+    
+    return SR_LiC, NR_LiC, HPR_LiC, DA_LiC, HDA_LiC, SR_ELM, NR_ELM, HPR_ELM, DA_ELM, HDA_ELM, SR_Pred, NR_Pred, HPR_Pred, DA_Pred, HDA_Pred, events["yTest"], events["yPredLiC_prob"], events["yPredELM_prob"], events["Y_multi_labels_test"], events["Y_predicted_test"]
 
 
 def FEAST_training(parent_folder):
@@ -2031,7 +2077,8 @@ def FEAST_training(parent_folder):
                             threshArray_noise[winnerNeuron] += thresholdRise
             
             w_signal = numpy.concatenate((w_satellites, w_stars), axis=1)
-            numpy.save("./output/feast/feast_weights.npy", w_signal, w_noise)
+            numpy.save("./output/feast/feast_weight_signal.npy", w_signal)
+            numpy.save("./output/feast/feast_weight_noise.npy", w_noise)
             
         # nNeuron = nNeuron_satellites + nNeuron_stars
         # sqNeuron = int(numpy.ceil(numpy.sqrt(nNeuron)))
@@ -2098,12 +2145,9 @@ def FEAST_inference(input_events, ground_truth, signalweight, noiseweight):
     ydMax = ys / downSampleFactor
 
     Valididx = 0
-    validnewTD0 = 0
-    validnewTD1 = 0
-    newTD0 = []
-    newTD1 = []
     coordinate = numpy.zeros((nTD, 4))
     labels = numpy.full_like(input_events['x'], numpy.nan)
+    ground_truth_labels = numpy.full_like(input_events['x'], numpy.nan)
 
     for idx in tqdm(range(nTD)):
         x = int(input_events['x'][idx])
@@ -2157,23 +2201,22 @@ def FEAST_inference(input_events, ground_truth, signalweight, noiseweight):
                 coordinate[Valididx, 0] = x
                 coordinate[Valididx, 1] = y
                 coordinate[Valididx, 2] = t
+                ground_truth_labels[Valididx] = ground_truth[idx]
 
                 if ground_truth[idx] == 0:
                     coordinate[Valididx, 3] = 0
-                    validnewTD0 += 1
                     labels[Valididx] = 0
 
                 elif ground_truth[idx] == 1:
                     coordinate[Valididx, 3] = 1
-                    validnewTD1 += 1
                     labels[Valididx] = 1
 
     where_are_NaNs = numpy.isnan(predicted_labels)
     predicted_labels[where_are_NaNs] = 0
-    return X_original, coordinate, labels, predicted_labels
+    return X_original, coordinate, labels, predicted_labels, ground_truth_labels
 
 
-def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
+def cross_validation(ground_truth, coordinate, X_original, labels, predicted_labels, trainTestSplitRatio=0.5):
     # Extract coordinates and timestamps
     xCoordArray = coordinate[:, 0]
     yCoordArray = coordinate[:, 1]
@@ -2182,6 +2225,8 @@ def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
     # Convert X and Y to single precision
     X = X_original.astype(numpy.float32)
     Y = labels.astype(numpy.float32)
+    Y_multi_labels = ground_truth.astype(numpy.float32)
+    Y_predicted = predicted_labels.astype(numpy.float32)
 
     # Find indices of NaN values in Y
     findNaN = numpy.where(numpy.isnan(Y))[0]
@@ -2189,6 +2234,8 @@ def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
     if len(findNaN) > 0:
         X = X[:findNaN[0], :]
         Y = Y[:findNaN[0]]
+        Y_multi_labels = Y_multi_labels[:findNaN[0]]
+        Y_predicted = Y_predicted[:findNaN[0]]
 
         xCoordArray = xCoordArray[:findNaN[0]]
         yCoordArray = yCoordArray[:findNaN[0]]
@@ -2200,6 +2247,8 @@ def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
     shuffledIndex = numpy.random.permutation(nEventAfterSkip)
     X_shuffled = X[shuffledIndex, :]
     Y_shuffled = Y[shuffledIndex]
+    Y_multi_labels_shuffled = Y_multi_labels[shuffledIndex]
+    Y_predicted_shuffled = Y_predicted[shuffledIndex]
 
     xCoordArray_shuffle = xCoordArray[shuffledIndex]
     yCoordArray_shuffle = yCoordArray[shuffledIndex]
@@ -2213,6 +2262,8 @@ def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
 
     Ytrain = Y_shuffled[:splitIndex]
     Ytest = Y_shuffled[splitIndex:]
+    Y_multi_labels_test = Y_multi_labels_shuffled[splitIndex:]
+    Y_predicted_test = Y_predicted_shuffled[splitIndex:]
 
     xCoordArraytest = xCoordArray_shuffle[splitIndex:]
     yCoordArraytest = yCoordArray_shuffle[splitIndex:]
@@ -2221,12 +2272,14 @@ def cross_validation(coordinate, X_original, labels, trainTestSplitRatio=0.5):
     # Replace NaN values in Ytrain and Ytest with 0
     Ytrain[numpy.isnan(Ytrain)] = 0
     Ytest[numpy.isnan(Ytest)] = 0
+    Y_multi_labels_test[numpy.isnan(Y_multi_labels_test)] = 0
+    Y_predicted_test[numpy.isnan(Y_predicted_test)] = 0
 
     # Create the second column for binary classification
     Ytrain = numpy.column_stack((Ytrain, 1 - Ytrain))
     Ytest = numpy.column_stack((Ytest, 1 - Ytest))
 
-    return Xtrain, Ytrain, Xtest, Ytest, xCoordArraytest, yCoordArraytest, tsCoordArraytest
+    return Xtrain, Ytrain, Xtest, Ytest, xCoordArraytest, yCoordArraytest, tsCoordArraytest, Y_multi_labels_test, Y_predicted_test
 
 
 
