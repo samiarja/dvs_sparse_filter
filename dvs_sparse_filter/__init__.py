@@ -57,7 +57,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 from math import exp, isfinite
 from scipy.linalg import expm, lstsq
 from collections import deque
-
+# from torchvision.transforms.functional import gaussian_blur
 # import cache
 # import stars
 import astropy
@@ -1085,9 +1085,9 @@ def roc_val(input_events, detected_noise, ground_truth):
     noise_intersection      = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 0))
     hot_pixel_intersection  = numpy.where(numpy.logical_and(detected_noise == 0,ground_truth == 2))
 
-    SR = 100*(len(signal_intersection[0])/len(numpy.where(ground_truth == 1)[0]))
-    NR = 100*(len(noise_intersection[0])/len(numpy.where(ground_truth == 0)[0]))
-    HPR = 100*(len(hot_pixel_intersection[0])/len(numpy.where(ground_truth == 2)[0]))
+    SR = 100*(len(signal_intersection[0])/(len(numpy.where(ground_truth == 1)[0])+1e-9))
+    NR = 100*(len(noise_intersection[0])/(len(numpy.where(ground_truth == 0)[0])+1e-9))
+    HPR = 100*(len(hot_pixel_intersection[0])/(len(numpy.where(ground_truth == 2)[0])+1e-9))
     DA = (SR+NR)/2
     HDA = (SR+NR+HPR)/3
     
@@ -1265,7 +1265,65 @@ def STCF(input_events, ground_truth, time_window):
     return output_events, performance, detected_noise
 
 
-def DFWF(input_events, ground_truth, time_window):
+def DWF(input_events, ground_truth, time_window):
+    print("Start processing DWF/FWF filter...")
+
+    ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
+    input_events = input_events[ii]
+    ground_truth = ground_truth[ii]
+
+    x_max, y_max = input_events['x'].max() + 1, input_events['y'].max() + 1
+    
+    print(f'Number of input event: {len(input_events["x"])}')
+
+    filter_instance             = DoubleFixedWindowFilter(sx=x_max, 
+                                                          sy=y_max,
+                                                          wlen=175, 
+                                                          disThr=100, 
+                                                          useDoubleMode=True, 
+                                                          numMustBeCorrelated=8)
+    boolean_mask, output_events = filter_instance.filter_packet(input_events)
+
+    print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
+    detected_noise = boolean_mask.astype(int)
+    
+    detected_noise = 1 - detected_noise
+    ###################################################################################
+    # vx_velocity_raw = numpy.zeros((len(input_events["x"]), 1)) + 0 / 1e6
+    # vy_velocity_raw = numpy.zeros((len(input_events["y"]), 1)) + 0 / 1e6
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       input_events["label"].astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events,
+    #                                                       detected_noise.astype(numpy.int32),
+    #                                                       (vx_velocity_raw,vy_velocity_raw))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==0],
+    #                                                       detected_noise[detected_noise==0].astype(numpy.int32),
+    #                                                       (vx_velocity_raw[detected_noise==0],vy_velocity_raw[detected_noise==0]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    
+    # cumulative_map_object, seg_label = accumulate_cnt_rgb((1280,720),input_events[detected_noise==1],
+    #                                                         detected_noise[detected_noise==1].astype(numpy.int32),
+    #                                                         (vx_velocity_raw[detected_noise==1],vy_velocity_raw[detected_noise==1]))
+    # warped_image_segmentation_raw    = rgb_render_white(cumulative_map_object, seg_label)
+    # warped_image_segmentation_raw.show()
+    ##################################################################################
+
+
+    precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA = roc_val(input_events, detected_noise, ground_truth)
+    performance = [precision_noise, recall_noise, f1_noise, precision_hp, recall_hp, f1_hp, SR, NR, HPR, DA, HDA]
+
+    return output_events, performance, detected_noise
+
+
+def FWF(input_events, ground_truth, time_window):
     print("Start processing DWF/FWF filter...")
 
     ii = numpy.where(numpy.logical_and(input_events["t"] >= time_window[0], input_events["t"] <= time_window[1]))
@@ -1333,7 +1391,10 @@ def TS(input_events, ground_truth, time_window):
 
     print(f'Number of input event: {len(input_events["x"])}')
 
-    time_surface_filter = TimeSurfaceFilter(resolution=(x_max, y_max))
+    time_surface_filter = TimeSurfaceFilter(resolution=(x_max, y_max),
+                                            decay=100000, 
+                                            search_radius=5,
+                                            float_threshold=0.01)
     boolean_mask, output_events = time_surface_filter << input_events
 
     print(f'Number of detected noise event: {len(input_events) - len(output_events)}')
@@ -4789,9 +4850,10 @@ def rgb_render_white(cumulative_map_object, l_values):
         """Generate an array of intense and bright RGB colors, avoiding blue."""
         base_palette = numpy.array([
             [255, 255, 255],  # White (will invert to black)
-            [0, 255, 255],    # Cyan (will invert to red)
             [255, 0, 255],    # Magenta (will invert to green)
+            [0, 255, 255],    # Cyan (will invert to red)
             [255, 255, 0],    # Yellow (will invert to blue)
+            
             [0, 255, 0],      # Green (will invert to magenta)
             [255, 0, 0],      # Red (will invert to cyan)
             [0, 128, 128],    # Teal (will invert to a light orange)
