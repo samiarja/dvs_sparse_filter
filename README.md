@@ -1,18 +1,25 @@
-# Denoising Very Sparse Events for Neuromorphic Space Imaging
+# Noise Filtering Benchmark for Neuromorphic Satellites Observations
 
 <!-- <p align="center" width="100%">
     <img width="50%" src="fig/hot_pixel_package_logo2.png">
 </p> -->
 
-Project page: https://samiarja.github.io/dvseventfilter/
-
-# Goal
-
-Below are the motivations and the goals of this work as well as the contributions:
-- A long term study of the change in noise and hot pixels
+<!-- Project page: https://samiarja.github.io/dvseventfilter/ -->
 
 
-# Installation
+
+# Setup
+
+## Requirements
+
+- python: 3.9.x, 3.10.x
+
+## Tested environments
+- Ubuntu 22.04
+- Conda 23.1.0
+- Python 3.9.18
+
+## Installation
 
 ```sh
 conda create --name dvs_sparse_filter python=3.9
@@ -36,3 +43,5 @@ conda install -c conda-forge pydensecrf
 
 
 # Run
+
+In progress...
